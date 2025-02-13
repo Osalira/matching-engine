@@ -1,0 +1,22 @@
+# Compiled binaries and shared libraries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and output
+*.test
+*.out
+
+# Dependency directories (if vendoring dependencies)
+vendor/
+
+# Go build cache and logs
+*.log
+
+# IDE and OS-specific files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
