@@ -70,6 +70,7 @@ type TradeUpdate struct {
 	Status       string `json:"status"`
 	ExecutedQty  int64  `json:"executed_quantity"`
 	RemainingQty int64  `json:"remaining_quantity"`
+	Quantity     int64  `json:"quantity"` // Total order quantity
 }
 
 func init() {
@@ -268,31 +269,26 @@ func (tp *TradeProcessor) processTradeNotifications() {
 
 // processTrade handles a single trade
 func (tp *TradeProcessor) processTrade(trade engine.Trade) error {
-	// Update order status for both buyer and seller
-	buyerUpdate := TradeUpdate{
-		OrderID:      trade.BuyOrderID,
-		Status:       "PARTIALLY_COMPLETE",
-		ExecutedQty:  trade.Quantity,
-		RemainingQty: 0, // Will be calculated by trading service
+	// Step 1: Create trade record
+	if err := tp.createTradeRecord(trade); err != nil {
+		return fmt.Errorf("failed to create trade record: %w", err)
 	}
 
-	sellerUpdate := TradeUpdate{
-		OrderID:      trade.SellOrderID,
-		Status:       "PARTIALLY_COMPLETE",
-		ExecutedQty:  trade.Quantity,
-		RemainingQty: 0, // Will be calculated by trading service
+	// Step 2: Update wallets
+	if err := tp.updateWallets(trade); err != nil {
+		// Rollback trade record if wallet update fails
+		tp.rollbackTrade(trade)
+		return fmt.Errorf("failed to update wallets: %w", err)
 	}
 
-	// Send updates to trading service
-	if err := tp.updateTradeStatus(buyerUpdate); err != nil {
-		return fmt.Errorf("failed to update buyer order status: %w", err)
+	// Step 3: Update order statuses
+	if err := tp.updateOrderStatuses(trade); err != nil {
+		// Rollback wallet updates and trade record
+		tp.rollbackTrade(trade)
+		return fmt.Errorf("failed to update order statuses: %w", err)
 	}
 
-	if err := tp.updateTradeStatus(sellerUpdate); err != nil {
-		return fmt.Errorf("failed to update seller order status: %w", err)
-	}
-
-	// Broadcast trade to all connected clients
+	// Step 4: Broadcast trade notification (with proper mutex handling)
 	notification := TradeNotification{
 		Type:      "trade",
 		Trade:     trade,
@@ -300,14 +296,20 @@ func (tp *TradeProcessor) processTrade(trade engine.Trade) error {
 	}
 
 	clientsMux.RLock()
+	clientsCopy := make([]*websocket.Conn, 0, len(clients))
 	for client := range clients {
-		if err := client.WriteJSON(notification); err != nil {
-			log.Error().Err(err).Msg("Failed to send trade notification to client")
-			client.Close()
-			delete(clients, client)
-		}
+		clientsCopy = append(clientsCopy, client)
 	}
 	clientsMux.RUnlock()
+
+	for _, client := range clientsCopy {
+		if err := client.WriteJSON(notification); err != nil {
+			clientsMux.Lock()
+			delete(clients, client)
+			clientsMux.Unlock()
+			client.Close()
+		}
+	}
 
 	return nil
 }
@@ -337,54 +339,70 @@ func (tp *TradeProcessor) updateTradeStatus(update TradeUpdate) error {
 }
 
 func (tp *TradeProcessor) updateOrderStatuses(trade engine.Trade) error {
+	// Get current order states from trading service
+	buyOrder, err := tp.getOrderStatus(trade.BuyOrderID)
+	if err != nil {
+		return fmt.Errorf("failed to get buy order status: %w", err)
+	}
+
+	sellOrder, err := tp.getOrderStatus(trade.SellOrderID)
+	if err != nil {
+		return fmt.Errorf("failed to get sell order status: %w", err)
+	}
+
+	// Calculate remaining quantities
+	buyRemaining := buyOrder.Quantity - trade.Quantity
+	sellRemaining := sellOrder.Quantity - trade.Quantity
+
 	// Create updates for both orders
 	buyUpdate := TradeUpdate{
 		OrderID:      trade.BuyOrderID,
 		ExecutedQty:  trade.Quantity,
-		RemainingQty: 0, // Will be set by the trading service
-		Status:       "PARTIALLY_COMPLETE",
+		RemainingQty: buyRemaining,
+		Status:       tp.determineOrderStatus(buyRemaining),
+		Quantity:     trade.Quantity,
 	}
 
 	sellUpdate := TradeUpdate{
 		OrderID:      trade.SellOrderID,
 		ExecutedQty:  trade.Quantity,
-		RemainingQty: 0, // Will be set by the trading service
-		Status:       "PARTIALLY_COMPLETE",
+		RemainingQty: sellRemaining,
+		Status:       tp.determineOrderStatus(sellRemaining),
+		Quantity:     trade.Quantity,
 	}
 
 	// Send updates to trading service
-	buyUpdateReq, err := json.Marshal(buyUpdate)
-	if err != nil {
-		return fmt.Errorf("failed to marshal buy order update: %w", err)
+	if err := tp.updateTradeStatus(buyUpdate); err != nil {
+		return fmt.Errorf("failed to update buy order: %w", err)
 	}
 
-	sellUpdateReq, err := json.Marshal(sellUpdate)
-	if err != nil {
-		return fmt.Errorf("failed to marshal sell order update: %w", err)
+	if err := tp.updateTradeStatus(sellUpdate); err != nil {
+		return fmt.Errorf("failed to update sell order: %w", err)
 	}
-
-	// Send updates to trading service
-	resp, err := http.Post(
-		fmt.Sprintf("%s/api/trading/orders/update", tp.tradingServiceURL),
-		"application/json",
-		bytes.NewBuffer(buyUpdateReq),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to send buy order update: %w", err)
-	}
-	defer resp.Body.Close()
-
-	resp, err = http.Post(
-		fmt.Sprintf("%s/api/trading/orders/update", tp.tradingServiceURL),
-		"application/json",
-		bytes.NewBuffer(sellUpdateReq),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to send sell order update: %w", err)
-	}
-	defer resp.Body.Close()
 
 	return nil
+}
+
+func (tp *TradeProcessor) determineOrderStatus(remainingQty int64) string {
+	if remainingQty > 0 {
+		return "PARTIALLY_COMPLETE"
+	}
+	return "COMPLETED"
+}
+
+func (tp *TradeProcessor) getOrderStatus(orderID string) (*TradeUpdate, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/api/orders/%s", tp.tradingServiceURL, orderID))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var order TradeUpdate
+	if err := json.NewDecoder(resp.Body).Decode(&order); err != nil {
+		return nil, err
+	}
+
+	return &order, nil
 }
 
 func (tp *TradeProcessor) createTradeRecord(trade engine.Trade) error {
