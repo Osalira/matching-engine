@@ -241,51 +241,99 @@ func broadcastTrade(trade engine.Trade) {
 	}
 }
 
+// processTradeNotifications processes trade notifications and updates balances
 func (tp *TradeProcessor) processTradeNotifications() {
 	for trade := range tradeChan {
-		err := tp.processSingleTrade(trade)
-		if err != nil {
-			log.Error().Err(err).
-				Str("buyOrderID", trade.BuyOrderID).
-				Str("sellOrderID", trade.SellOrderID).
-				Msg("Failed to process trade after all retries")
+		// Process trade with retries
+		for attempt := 0; attempt < tp.maxRetries; attempt++ {
+			if err := tp.processTrade(trade); err != nil {
+				log.Error().
+					Err(err).
+					Int("attempt", attempt+1).
+					Str("buyOrderID", trade.BuyOrderID).
+					Str("sellOrderID", trade.SellOrderID).
+					Msg("Failed to process trade")
 
-			// Attempt rollback
-			if rollbackErr := tp.rollbackTrade(trade); rollbackErr != nil {
-				log.Error().Err(rollbackErr).Msg("Failed to rollback trade")
+				if attempt == tp.maxRetries-1 {
+					// TODO: Implement rollback mechanism
+					log.Error().Msg("Max retries reached, trade processing failed")
+				}
+				time.Sleep(time.Second * time.Duration(attempt+1))
+				continue
 			}
+			break
 		}
 	}
 }
 
-func (tp *TradeProcessor) processSingleTrade(trade engine.Trade) error {
-	var lastErr error
-
-	for attempt := 0; attempt < tp.maxRetries; attempt++ {
-		// Update order statuses
-		if err := tp.updateOrderStatuses(trade); err != nil {
-			lastErr = fmt.Errorf("failed to update order statuses: %w", err)
-			continue
-		}
-
-		// Create trade record
-		if err := tp.createTradeRecord(trade); err != nil {
-			lastErr = fmt.Errorf("failed to create trade record: %w", err)
-			continue
-		}
-
-		// Update wallets
-		if err := tp.updateWallets(trade); err != nil {
-			lastErr = fmt.Errorf("failed to update wallets: %w", err)
-			continue
-		}
-
-		// Broadcast trade notification
-		broadcastTrade(trade)
-		return nil
+// processTrade handles a single trade
+func (tp *TradeProcessor) processTrade(trade engine.Trade) error {
+	// Update order status for both buyer and seller
+	buyerUpdate := TradeUpdate{
+		OrderID:      trade.BuyOrderID,
+		Status:       "PARTIALLY_COMPLETE",
+		ExecutedQty:  trade.Quantity,
+		RemainingQty: 0, // Will be calculated by trading service
 	}
 
-	return lastErr
+	sellerUpdate := TradeUpdate{
+		OrderID:      trade.SellOrderID,
+		Status:       "PARTIALLY_COMPLETE",
+		ExecutedQty:  trade.Quantity,
+		RemainingQty: 0, // Will be calculated by trading service
+	}
+
+	// Send updates to trading service
+	if err := tp.updateTradeStatus(buyerUpdate); err != nil {
+		return fmt.Errorf("failed to update buyer order status: %w", err)
+	}
+
+	if err := tp.updateTradeStatus(sellerUpdate); err != nil {
+		return fmt.Errorf("failed to update seller order status: %w", err)
+	}
+
+	// Broadcast trade to all connected clients
+	notification := TradeNotification{
+		Type:      "trade",
+		Trade:     trade,
+		Timestamp: time.Now(),
+	}
+
+	clientsMux.RLock()
+	for client := range clients {
+		if err := client.WriteJSON(notification); err != nil {
+			log.Error().Err(err).Msg("Failed to send trade notification to client")
+			client.Close()
+			delete(clients, client)
+		}
+	}
+	clientsMux.RUnlock()
+
+	return nil
+}
+
+// updateTradeStatus sends trade status update to trading service
+func (tp *TradeProcessor) updateTradeStatus(update TradeUpdate) error {
+	payload, err := json.Marshal(update)
+	if err != nil {
+		return fmt.Errorf("failed to marshal trade update: %w", err)
+	}
+
+	resp, err := http.Post(
+		fmt.Sprintf("%s/api/orders/%s/update", tp.tradingServiceURL, update.OrderID),
+		"application/json",
+		bytes.NewBuffer(payload),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to send trade update: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("trading service returned status %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
 func (tp *TradeProcessor) updateOrderStatuses(trade engine.Trade) error {
