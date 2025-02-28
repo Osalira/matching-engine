@@ -2,97 +2,506 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"matching-engine/engine"
+	"log"
 	"net/http"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
-	"github.com/shopspring/decimal"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
+
+// Order represents a stock order
+type Order struct {
+	ID            int64     `json:"id"`
+	UserID        int64     `json:"user_id"`
+	StockID       int64     `json:"stock_id"`
+	IsBuy         bool      `json:"is_buy"`
+	OrderType     string    `json:"order_type"`
+	Status        string    `json:"status"`
+	Quantity      int       `json:"quantity"`
+	Price         float64   `json:"price"`
+	Timestamp     time.Time `json:"timestamp"`
+	ParentOrderID *int64    `json:"parent_order_id,omitempty"`
+}
+
+// OrderBook holds buy and sell orders for a stock
+type OrderBook struct {
+	StockID    int64
+	BuyOrders  []Order
+	SellOrders []Order
+	Mutex      sync.Mutex
+}
+
+// OrderBookManager manages multiple order books
+type OrderBookManager struct {
+	OrderBooks map[int64]*OrderBook
+	Mutex      sync.RWMutex
+}
 
 // Global variables
 var (
-	orderBooks = make(map[string]*engine.OrderBook)
-	booksMutex sync.RWMutex
-	tradeChan  = make(chan engine.Trade, 1000) // Buffer for 1000 trades
-	clients    = make(map[*websocket.Conn]bool)
-	clientsMux sync.RWMutex
-	upgrader   = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin: func(r *http.Request) bool {
-			return true // In production, implement proper origin checking
-		},
-	}
+	db              *sql.DB
+	orderBookMgr    *OrderBookManager
+	tradingEndpoint string
 )
 
-// OrderRequest represents an incoming order request
-type OrderRequest struct {
-	Symbol    string  `json:"symbol"`
-	OrderType string  `json:"order_type"` // "BUY" or "SELL"
-	Price     float64 `json:"price"`
-	Quantity  int64   `json:"quantity"`
-	UserID    string  `json:"user_id"`
+// Database connection
+func initDB() (*sql.DB, error) {
+	// Load environment variables
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: .env file not found")
+	}
+
+	// Get database connection parameters
+	dbHost := os.Getenv("DB_HOST")
+	dbPort := os.Getenv("DB_PORT")
+	dbUser := os.Getenv("DB_USER")
+	dbPassword := os.Getenv("DB_PASSWORD")
+	dbName := os.Getenv("DB_NAME")
+
+	// Create connection string
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		dbHost, dbPort, dbUser, dbPassword, dbName)
+
+	// Connect to database
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check connection
+	err = db.Ping()
+	if err != nil {
+		return nil, err
+	}
+
+	log.Println("Connected to database")
+	return db, nil
 }
 
-// TradeNotification represents a trade notification sent to clients
-type TradeNotification struct {
-	Type      string       `json:"type"`
-	Trade     engine.Trade `json:"trade"`
-	Timestamp time.Time    `json:"timestamp"`
-}
-
-// TradeProcessor handles trade processing with retries and rollback
-type TradeProcessor struct {
-	maxRetries        int
-	tradingServiceURL string
-	walletServiceURL  string
-}
-
-func NewTradeProcessor() *TradeProcessor {
-	return &TradeProcessor{
-		maxRetries:        3,
-		tradingServiceURL: os.Getenv("TRADING_SERVICE_URL"),
-		walletServiceURL:  os.Getenv("WALLET_SERVICE_URL"),
+// Initialize order book manager
+func initOrderBookManager() *OrderBookManager {
+	return &OrderBookManager{
+		OrderBooks: make(map[int64]*OrderBook),
 	}
 }
 
-// TradeUpdate represents an order status update after a trade
-type TradeUpdate struct {
-	OrderID      string `json:"order_id"`
-	Status       string `json:"status"`
-	ExecutedQty  int64  `json:"executed_quantity"`
-	RemainingQty int64  `json:"remaining_quantity"`
-	Quantity     int64  `json:"quantity"` // Total order quantity
+// Get or create order book for a stock
+func (mgr *OrderBookManager) GetOrderBook(stockID int64) *OrderBook {
+	mgr.Mutex.RLock()
+	ob, exists := mgr.OrderBooks[stockID]
+	mgr.Mutex.RUnlock()
+
+	if !exists {
+		// Create new order book
+		ob = &OrderBook{
+			StockID:    stockID,
+			BuyOrders:  []Order{},
+			SellOrders: []Order{},
+		}
+
+		// Store in manager
+		mgr.Mutex.Lock()
+		mgr.OrderBooks[stockID] = ob
+		mgr.Mutex.Unlock()
+	}
+
+	return ob
 }
 
-func init() {
-	// Configure zerolog
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
+// Handler for placing a stock order
+func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
+	// Parse request body
+	var order Order
+	err := json.NewDecoder(r.Body).Decode(&order)
+	if err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate order
+	if order.StockID <= 0 || order.UserID <= 0 || order.Quantity <= 0 {
+		http.Error(w, "Invalid order parameters", http.StatusBadRequest)
+		return
+	}
+
+	// Set initial status
+	order.Status = "Pending"
+	order.Timestamp = time.Now()
+
+	// Process order
+	result, err := processOrder(order)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error processing order: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Return response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// Process an order (match or add to order book)
+func processOrder(order Order) (map[string]interface{}, error) {
+	// Get order book for stock
+	orderBook := orderBookMgr.GetOrderBook(order.StockID)
+	orderBook.Mutex.Lock()
+	defer orderBook.Mutex.Unlock()
+
+	// For market orders, try to match immediately
+	if order.OrderType == "Market" {
+		// TODO: Implement market order logic
+		return nil, fmt.Errorf("market orders not implemented yet")
+	}
+
+	// For limit orders, try to match or add to order book
+	if order.OrderType == "Limit" {
+		// Insert order into database
+		var orderID int64
+		err := db.QueryRow(
+			"INSERT INTO orders (user_id, stock_id, is_buy, order_type, status, quantity, price, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+			order.UserID, order.StockID, order.IsBuy, order.OrderType, order.Status, order.Quantity, order.Price, order.Timestamp,
+		).Scan(&orderID)
+		if err != nil {
+			return nil, err
+		}
+		order.ID = orderID
+
+		// Try to match order
+		matches, remainingQty := matchLimitOrder(order)
+
+		// If fully matched, update status
+		if remainingQty == 0 {
+			_, err = db.Exec("UPDATE orders SET status = 'Completed' WHERE id = $1", order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.Status = "Completed"
+		} else if len(matches) > 0 && remainingQty < order.Quantity {
+			// If partially matched, update status and quantity
+			_, err = db.Exec("UPDATE orders SET status = 'Partially_complete', quantity = $1 WHERE id = $2", remainingQty, order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.Status = "Partially_complete"
+			order.Quantity = remainingQty
+
+			// Add to order book
+			if order.IsBuy {
+				orderBook.BuyOrders = append(orderBook.BuyOrders, order)
+			} else {
+				orderBook.SellOrders = append(orderBook.SellOrders, order)
+			}
+		} else {
+			// If no matches, update status and add to order book
+			_, err = db.Exec("UPDATE orders SET status = 'InProgress' WHERE id = $1", order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.Status = "InProgress"
+
+			// Add to order book
+			if order.IsBuy {
+				orderBook.BuyOrders = append(orderBook.BuyOrders, order)
+			} else {
+				orderBook.SellOrders = append(orderBook.SellOrders, order)
+			}
+		}
+
+		// Prepare response
+		result := map[string]interface{}{
+			"order_id": order.ID,
+			"status":   order.Status,
+			"matches":  matches,
+		}
+
+		return result, nil
+	}
+
+	return nil, fmt.Errorf("unsupported order type: %s", order.OrderType)
+}
+
+// Match a limit order against the order book
+func matchLimitOrder(order Order) ([]map[string]interface{}, int) {
+	orderBook := orderBookMgr.GetOrderBook(order.StockID)
+	var matches []map[string]interface{}
+	remainingQty := order.Quantity
+
+	if order.IsBuy {
+		// Buy order - match against sell orders
+		for i := 0; i < len(orderBook.SellOrders) && remainingQty > 0; i++ {
+			sellOrder := orderBook.SellOrders[i]
+
+			// Check if sell order price is less than or equal to buy price
+			if sellOrder.Price <= order.Price {
+				// Match the orders
+				matchQty := min(remainingQty, sellOrder.Quantity)
+
+				// Create match record
+				match := map[string]interface{}{
+					"matched_order_id": sellOrder.ID,
+					"price":            sellOrder.Price,
+					"quantity":         matchQty,
+				}
+				matches = append(matches, match)
+
+				// Update remaining quantity
+				remainingQty -= matchQty
+
+				// Update sell order quantity
+				sellOrder.Quantity -= matchQty
+				if sellOrder.Quantity == 0 {
+					// Remove sell order from book
+					orderBook.SellOrders = append(orderBook.SellOrders[:i], orderBook.SellOrders[i+1:]...)
+					i--
+
+					// Update sell order status in database
+					_, err := db.Exec("UPDATE orders SET status = 'Completed', quantity = 0 WHERE id = $1", sellOrder.ID)
+					if err != nil {
+						log.Printf("Error updating sell order: %v", err)
+					}
+				} else {
+					// Update sell order quantity in database
+					_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", sellOrder.Quantity, sellOrder.ID)
+					if err != nil {
+						log.Printf("Error updating sell order: %v", err)
+					}
+				}
+
+				// Create transaction record
+				createTransaction(order.ID, sellOrder.ID, matchQty, sellOrder.Price)
+			}
+		}
+	} else {
+		// Sell order - match against buy orders
+		for i := 0; i < len(orderBook.BuyOrders) && remainingQty > 0; i++ {
+			buyOrder := orderBook.BuyOrders[i]
+
+			// Check if buy order price is greater than or equal to sell price
+			if buyOrder.Price >= order.Price {
+				// Match the orders
+				matchQty := min(remainingQty, buyOrder.Quantity)
+
+				// Create match record
+				match := map[string]interface{}{
+					"matched_order_id": buyOrder.ID,
+					"price":            buyOrder.Price,
+					"quantity":         matchQty,
+				}
+				matches = append(matches, match)
+
+				// Update remaining quantity
+				remainingQty -= matchQty
+
+				// Update buy order quantity
+				buyOrder.Quantity -= matchQty
+				if buyOrder.Quantity == 0 {
+					// Remove buy order from book
+					orderBook.BuyOrders = append(orderBook.BuyOrders[:i], orderBook.BuyOrders[i+1:]...)
+					i--
+
+					// Update buy order status in database
+					_, err := db.Exec("UPDATE orders SET status = 'Completed', quantity = 0 WHERE id = $1", buyOrder.ID)
+					if err != nil {
+						log.Printf("Error updating buy order: %v", err)
+					}
+				} else {
+					// Update buy order quantity in database
+					_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", buyOrder.Quantity, buyOrder.ID)
+					if err != nil {
+						log.Printf("Error updating buy order: %v", err)
+					}
+				}
+
+				// Create transaction record
+				createTransaction(buyOrder.ID, order.ID, matchQty, buyOrder.Price)
+			}
+		}
+	}
+
+	return matches, remainingQty
+}
+
+// Create a transaction record for matched orders
+func createTransaction(buyOrderID, sellOrderID int64, quantity int, price float64) {
+	// Get buy order details
+	var buyOrder Order
+	err := db.QueryRow("SELECT user_id, stock_id FROM orders WHERE id = $1", buyOrderID).Scan(&buyOrder.UserID, &buyOrder.StockID)
+	if err != nil {
+		log.Printf("Error getting buy order details: %v", err)
+		return
+	}
+
+	// Get sell order details
+	var sellOrder Order
+	err = db.QueryRow("SELECT user_id FROM orders WHERE id = $1", sellOrderID).Scan(&sellOrder.UserID)
+	if err != nil {
+		log.Printf("Error getting sell order details: %v", err)
+		return
+	}
+
+	// Insert transaction record
+	_, err = db.Exec(
+		"INSERT INTO transactions (buy_order_id, sell_order_id, buy_user_id, sell_user_id, stock_id, quantity, price, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+		buyOrderID, sellOrderID, buyOrder.UserID, sellOrder.UserID, buyOrder.StockID, quantity, price, time.Now(),
+	)
+	if err != nil {
+		log.Printf("Error creating transaction record: %v", err)
+		return
+	}
+
+	// Notify trading service
+	notifyTradingService(buyOrder.UserID, sellOrder.UserID, buyOrder.StockID, quantity, price)
+}
+
+// Notify trading service about a completed transaction
+func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int, price float64) {
+	// Create notification payload
+	payload := map[string]interface{}{
+		"buy_user_id":  buyUserID,
+		"sell_user_id": sellUserID,
+		"stock_id":     stockID,
+		"quantity":     quantity,
+		"price":        price,
+		"timestamp":    time.Now(),
+	}
+
+	// Convert to JSON
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error creating notification payload: %v", err)
+		return
+	}
+
+	// Send to trading service
+	resp, err := http.Post(tradingEndpoint+"/api/transaction/processTransaction", "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("Error notifying trading service: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check response
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Trading service returned non-OK status: %d", resp.StatusCode)
+	}
+}
+
+// Handler for cancelling a stock order
+func cancelOrderHandler(w http.ResponseWriter, r *http.Request) {
+	// Parse request body
+	var data struct {
+		TransactionID int64 `json:"transaction_id"`
+	}
+	err := json.NewDecoder(r.Body).Decode(&data)
+	if err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Get order details
+	var order Order
+	err = db.QueryRow(
+		"SELECT id, user_id, stock_id, is_buy, order_type, status, quantity, price FROM orders WHERE id = $1",
+		data.TransactionID,
+	).Scan(&order.ID, &order.UserID, &order.StockID, &order.IsBuy, &order.OrderType, &order.Status, &order.Quantity, &order.Price)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "Order not found", http.StatusNotFound)
+		} else {
+			http.Error(w, fmt.Sprintf("Error fetching order: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Check if order can be cancelled
+	if order.Status != "InProgress" && order.Status != "Partially_complete" {
+		http.Error(w, fmt.Sprintf("Cannot cancel order with status: %s", order.Status), http.StatusBadRequest)
+		return
+	}
+
+	// Cancel order
+	_, err = db.Exec("UPDATE orders SET status = 'Cancelled' WHERE id = $1", order.ID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error cancelling order: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Remove from order book
+	orderBook := orderBookMgr.GetOrderBook(order.StockID)
+	orderBook.Mutex.Lock()
+	if order.IsBuy {
+		for i, o := range orderBook.BuyOrders {
+			if o.ID == order.ID {
+				orderBook.BuyOrders = append(orderBook.BuyOrders[:i], orderBook.BuyOrders[i+1:]...)
+				break
+			}
+		}
+	} else {
+		for i, o := range orderBook.SellOrders {
+			if o.ID == order.ID {
+				orderBook.SellOrders = append(orderBook.SellOrders[:i], orderBook.SellOrders[i+1:]...)
+				break
+			}
+		}
+	}
+	orderBook.Mutex.Unlock()
+
+	// Return success response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Order cancelled successfully"})
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Health check handler
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "healthy",
+		"service": "matching-engine",
+	})
 }
 
 func main() {
-	// Initialize trade processor
-	tradeProcessor := NewTradeProcessor()
+	var err error
 
-	// Start trade notification processor
-	go tradeProcessor.processTradeNotifications()
+	// Initialize database
+	db, err = initDB()
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.Close()
+
+	// Initialize order book manager
+	orderBookMgr = initOrderBookManager()
+
+	// Set trading service endpoint
+	tradingEndpoint = os.Getenv("TRADING_SERVICE_URL")
+	if tradingEndpoint == "" {
+		tradingEndpoint = "http://trading-service:8000"
+	}
 
 	// Create router
 	r := mux.NewRouter()
 
 	// Register routes
-	r.HandleFunc("/health", healthCheck).Methods("GET")
-	r.HandleFunc("/api/orders", placeOrder).Methods("POST")
-	r.HandleFunc("/ws", handleWebSocket)
+	r.HandleFunc("/health", healthCheckHandler).Methods("GET")
+	r.HandleFunc("/api/placeStockOrder", placeOrderHandler).Methods("POST")
+	r.HandleFunc("/api/cancelStockTransaction", cancelOrderHandler).Methods("POST")
 
 	// Start server
 	port := os.Getenv("PORT")
@@ -100,435 +509,6 @@ func main() {
 		port = "8080"
 	}
 
-	log.Info().Msgf("Starting matching engine server on port %s", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
-		log.Fatal().Err(err).Msg("Server failed to start")
-	}
-}
-
-// healthCheck handles health check requests
-func healthCheck(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
-}
-
-// placeOrder handles new order placement requests
-func placeOrder(w http.ResponseWriter, r *http.Request) {
-	var req OrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Validate request
-	if err := validateOrderRequest(req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Get or create order book for the symbol
-	book := getOrCreateOrderBook(req.Symbol)
-
-	// Create order
-	order := engine.Order{
-		ID:        fmt.Sprintf("order_%d", time.Now().UnixNano()),
-		Type:      engine.OrderType(req.OrderType),
-		Symbol:    req.Symbol,
-		Price:     decimal.NewFromFloat(req.Price),
-		Quantity:  req.Quantity,
-		UserID:    req.UserID,
-		Timestamp: time.Now(),
-	}
-
-	// Add order to book
-	if err := book.AddOrder(order); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Return success response
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{
-		"order_id": order.ID,
-		"status":   "accepted",
-	})
-}
-
-// validateOrderRequest validates the incoming order request
-func validateOrderRequest(req OrderRequest) error {
-	if req.Symbol == "" {
-		return fmt.Errorf("symbol is required")
-	}
-	if req.OrderType != "BUY" && req.OrderType != "SELL" {
-		return fmt.Errorf("invalid order type: must be BUY or SELL")
-	}
-	if req.Price <= 0 {
-		return fmt.Errorf("price must be positive")
-	}
-	if req.Quantity <= 0 {
-		return fmt.Errorf("quantity must be positive")
-	}
-	if req.UserID == "" {
-		return fmt.Errorf("user_id is required")
-	}
-	return nil
-}
-
-// getOrCreateOrderBook gets or creates an order book for a symbol
-func getOrCreateOrderBook(symbol string) *engine.OrderBook {
-	booksMutex.Lock()
-	defer booksMutex.Unlock()
-
-	book, exists := orderBooks[symbol]
-	if !exists {
-		book = engine.NewOrderBook(symbol, tradeChan)
-		orderBooks[symbol] = book
-	}
-	return book
-}
-
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to upgrade connection to WebSocket")
-		return
-	}
-	defer conn.Close()
-
-	// Register client
-	clientsMux.Lock()
-	clients[conn] = true
-	clientsMux.Unlock()
-
-	// Remove client on disconnect
-	defer func() {
-		clientsMux.Lock()
-		delete(clients, conn)
-		clientsMux.Unlock()
-	}()
-
-	// Keep connection alive
-	for {
-		// Read messages (if needed)
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			break
-		}
-	}
-}
-
-func broadcastTrade(trade engine.Trade) {
-	notification := TradeNotification{
-		Type:      "trade_executed",
-		Trade:     trade,
-		Timestamp: time.Now(),
-	}
-
-	payload, err := json.Marshal(notification)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to marshal trade notification")
-		return
-	}
-
-	clientsMux.RLock()
-	defer clientsMux.RUnlock()
-
-	for client := range clients {
-		err := client.WriteMessage(websocket.TextMessage, payload)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to send trade notification to client")
-			client.Close()
-			delete(clients, client)
-		}
-	}
-}
-
-// processTradeNotifications processes trade notifications and updates balances
-func (tp *TradeProcessor) processTradeNotifications() {
-	for trade := range tradeChan {
-		// Process trade with retries
-		for attempt := 0; attempt < tp.maxRetries; attempt++ {
-			if err := tp.processTrade(trade); err != nil {
-				log.Error().
-					Err(err).
-					Int("attempt", attempt+1).
-					Str("buyOrderID", trade.BuyOrderID).
-					Str("sellOrderID", trade.SellOrderID).
-					Msg("Failed to process trade")
-
-				if attempt == tp.maxRetries-1 {
-					// TODO: Implement rollback mechanism
-					log.Error().Msg("Max retries reached, trade processing failed")
-				}
-				time.Sleep(time.Second * time.Duration(attempt+1))
-				continue
-			}
-			break
-		}
-	}
-}
-
-// processTrade handles a single trade
-func (tp *TradeProcessor) processTrade(trade engine.Trade) error {
-	// Step 1: Create trade record
-	if err := tp.createTradeRecord(trade); err != nil {
-		return fmt.Errorf("failed to create trade record: %w", err)
-	}
-
-	// Step 2: Update wallets
-	if err := tp.updateWallets(trade); err != nil {
-		// Rollback trade record if wallet update fails
-		tp.rollbackTrade(trade)
-		return fmt.Errorf("failed to update wallets: %w", err)
-	}
-
-	// Step 3: Update order statuses
-	if err := tp.updateOrderStatuses(trade); err != nil {
-		// Rollback wallet updates and trade record
-		tp.rollbackTrade(trade)
-		return fmt.Errorf("failed to update order statuses: %w", err)
-	}
-
-	// Step 4: Broadcast trade notification (with proper mutex handling)
-	notification := TradeNotification{
-		Type:      "trade",
-		Trade:     trade,
-		Timestamp: time.Now(),
-	}
-
-	clientsMux.RLock()
-	clientsCopy := make([]*websocket.Conn, 0, len(clients))
-	for client := range clients {
-		clientsCopy = append(clientsCopy, client)
-	}
-	clientsMux.RUnlock()
-
-	for _, client := range clientsCopy {
-		if err := client.WriteJSON(notification); err != nil {
-			clientsMux.Lock()
-			delete(clients, client)
-			clientsMux.Unlock()
-			client.Close()
-		}
-	}
-
-	return nil
-}
-
-// updateTradeStatus sends trade status update to trading service
-func (tp *TradeProcessor) updateTradeStatus(update TradeUpdate) error {
-	payload, err := json.Marshal(update)
-	if err != nil {
-		return fmt.Errorf("failed to marshal trade update: %w", err)
-	}
-
-	resp, err := http.Post(
-		fmt.Sprintf("%s/api/orders/%s/update", tp.tradingServiceURL, update.OrderID),
-		"application/json",
-		bytes.NewBuffer(payload),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to send trade update: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("trading service returned status %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-func (tp *TradeProcessor) updateOrderStatuses(trade engine.Trade) error {
-	// Get current order states from trading service
-	buyOrder, err := tp.getOrderStatus(trade.BuyOrderID)
-	if err != nil {
-		return fmt.Errorf("failed to get buy order status: %w", err)
-	}
-
-	sellOrder, err := tp.getOrderStatus(trade.SellOrderID)
-	if err != nil {
-		return fmt.Errorf("failed to get sell order status: %w", err)
-	}
-
-	// Calculate remaining quantities
-	buyRemaining := buyOrder.Quantity - trade.Quantity
-	sellRemaining := sellOrder.Quantity - trade.Quantity
-
-	// Create updates for both orders
-	buyUpdate := TradeUpdate{
-		OrderID:      trade.BuyOrderID,
-		ExecutedQty:  trade.Quantity,
-		RemainingQty: buyRemaining,
-		Status:       tp.determineOrderStatus(buyRemaining),
-		Quantity:     trade.Quantity,
-	}
-
-	sellUpdate := TradeUpdate{
-		OrderID:      trade.SellOrderID,
-		ExecutedQty:  trade.Quantity,
-		RemainingQty: sellRemaining,
-		Status:       tp.determineOrderStatus(sellRemaining),
-		Quantity:     trade.Quantity,
-	}
-
-	// Send updates to trading service
-	if err := tp.updateTradeStatus(buyUpdate); err != nil {
-		return fmt.Errorf("failed to update buy order: %w", err)
-	}
-
-	if err := tp.updateTradeStatus(sellUpdate); err != nil {
-		return fmt.Errorf("failed to update sell order: %w", err)
-	}
-
-	return nil
-}
-
-func (tp *TradeProcessor) determineOrderStatus(remainingQty int64) string {
-	if remainingQty > 0 {
-		return "PARTIALLY_COMPLETE"
-	}
-	return "COMPLETED"
-}
-
-func (tp *TradeProcessor) getOrderStatus(orderID string) (*TradeUpdate, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/api/orders/%s", tp.tradingServiceURL, orderID))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var order TradeUpdate
-	if err := json.NewDecoder(resp.Body).Decode(&order); err != nil {
-		return nil, err
-	}
-
-	return &order, nil
-}
-
-func (tp *TradeProcessor) createTradeRecord(trade engine.Trade) error {
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	tradeRecord, err := json.Marshal(trade)
-	if err != nil {
-		return fmt.Errorf("failed to marshal trade record: %w", err)
-	}
-
-	resp, err := client.Post(
-		fmt.Sprintf("%s/api/trades", tp.tradingServiceURL),
-		"application/json",
-		bytes.NewBuffer(tradeRecord),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create trade record: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("failed to create trade record, status: %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-func (tp *TradeProcessor) updateWallets(trade engine.Trade) error {
-	// Calculate trade amount
-	tradeAmount := trade.Price.Mul(decimal.NewFromInt(trade.Quantity))
-
-	// Update buyer's wallet
-	buyerUpdate := map[string]interface{}{
-		"user_id":  trade.BuyerUserID,
-		"symbol":   trade.Symbol,
-		"quantity": trade.Quantity,
-		"amount":   tradeAmount.Neg(), // Negative amount for purchase
-	}
-
-	buyerUpdateReq, err := json.Marshal(buyerUpdate)
-	if err != nil {
-		return fmt.Errorf("failed to marshal buyer wallet update: %w", err)
-	}
-
-	// Update seller's wallet
-	sellerUpdate := map[string]interface{}{
-		"user_id":  trade.SellerUserID,
-		"symbol":   trade.Symbol,
-		"quantity": -trade.Quantity, // Negative quantity for sale
-		"amount":   tradeAmount,     // Positive amount for sale
-	}
-
-	sellerUpdateReq, err := json.Marshal(sellerUpdate)
-	if err != nil {
-		return fmt.Errorf("failed to marshal seller wallet update: %w", err)
-	}
-
-	// Send updates to wallet service
-	resp, err := http.Post(
-		fmt.Sprintf("%s/api/wallet/update", tp.walletServiceURL),
-		"application/json",
-		bytes.NewBuffer(buyerUpdateReq),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update buyer wallet: %w", err)
-	}
-	defer resp.Body.Close()
-
-	resp, err = http.Post(
-		fmt.Sprintf("%s/api/wallet/update", tp.walletServiceURL),
-		"application/json",
-		bytes.NewBuffer(sellerUpdateReq),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update seller wallet: %w", err)
-	}
-	defer resp.Body.Close()
-
-	return nil
-}
-
-func (tp *TradeProcessor) rollbackTrade(trade engine.Trade) error {
-	// Rollback order status updates
-	buyUpdate := TradeUpdate{
-		OrderID: trade.BuyOrderID,
-		Status:  "PENDING",
-	}
-
-	sellUpdate := TradeUpdate{
-		OrderID: trade.SellOrderID,
-		Status:  "PENDING",
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	// Rollback buy order
-	buyUpdateReq, err := json.Marshal(buyUpdate)
-	if err != nil {
-		return fmt.Errorf("failed to marshal buy order rollback: %w", err)
-	}
-
-	resp, err := client.Post(
-		fmt.Sprintf("%s/api/orders/%s/rollback", tp.tradingServiceURL, trade.BuyOrderID),
-		"application/json",
-		bytes.NewBuffer(buyUpdateReq),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to rollback buy order: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Rollback sell order
-	sellUpdateReq, err := json.Marshal(sellUpdate)
-	if err != nil {
-		return fmt.Errorf("failed to marshal sell order rollback: %w", err)
-	}
-
-	resp, err = client.Post(
-		fmt.Sprintf("%s/api/orders/%s/rollback", tp.tradingServiceURL, trade.SellOrderID),
-		"application/json",
-		bytes.NewBuffer(sellUpdateReq),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to rollback sell order: %w", err)
-	}
-	defer resp.Body.Close()
-
-	return nil
+	log.Printf("Starting matching engine on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, r))
 }
