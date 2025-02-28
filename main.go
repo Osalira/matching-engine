@@ -519,6 +519,107 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Initialize the database schema
+func initSchema(db *sql.DB) error {
+	log.Println("Checking database schema...")
+
+	// Check if orders table exists
+	var exists bool
+	err := db.QueryRow("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'orders')").Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("error checking if orders table exists: %v", err)
+	}
+
+	if !exists {
+		log.Println("Creating database schema...")
+
+		// Create orders table
+		_, err = db.Exec(`
+			CREATE TABLE orders (
+				id SERIAL PRIMARY KEY,
+				user_id INTEGER NOT NULL,
+				stock_id INTEGER NOT NULL,
+				is_buy BOOLEAN NOT NULL,
+				order_type VARCHAR(20) NOT NULL,
+				status VARCHAR(20) NOT NULL,
+				quantity INTEGER NOT NULL,
+				price DECIMAL(10, 2) NOT NULL,
+				timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				parent_order_id INTEGER REFERENCES orders(id)
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("error creating orders table: %v", err)
+		}
+
+		// Create indexes
+		_, err = db.Exec("CREATE INDEX idx_orders_stock_id ON orders(stock_id)")
+		if err != nil {
+			return fmt.Errorf("error creating stock_id index: %v", err)
+		}
+
+		_, err = db.Exec("CREATE INDEX idx_orders_user_id ON orders(user_id)")
+		if err != nil {
+			return fmt.Errorf("error creating user_id index: %v", err)
+		}
+
+		_, err = db.Exec("CREATE INDEX idx_orders_status ON orders(status)")
+		if err != nil {
+			return fmt.Errorf("error creating status index: %v", err)
+		}
+
+		// Create transactions table
+		_, err = db.Exec(`
+			CREATE TABLE transactions (
+				id SERIAL PRIMARY KEY,
+				buy_order_id INTEGER NOT NULL REFERENCES orders(id),
+				sell_order_id INTEGER NOT NULL REFERENCES orders(id),
+				buy_user_id INTEGER NOT NULL,
+				sell_user_id INTEGER NOT NULL,
+				stock_id INTEGER NOT NULL,
+				quantity INTEGER NOT NULL,
+				price DECIMAL(10, 2) NOT NULL,
+				timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("error creating transactions table: %v", err)
+		}
+
+		// Create transaction indexes
+		_, err = db.Exec("CREATE INDEX idx_transactions_buy_order_id ON transactions(buy_order_id)")
+		if err != nil {
+			return fmt.Errorf("error creating buy_order_id index: %v", err)
+		}
+
+		_, err = db.Exec("CREATE INDEX idx_transactions_sell_order_id ON transactions(sell_order_id)")
+		if err != nil {
+			return fmt.Errorf("error creating sell_order_id index: %v", err)
+		}
+
+		_, err = db.Exec("CREATE INDEX idx_transactions_buy_user_id ON transactions(buy_user_id)")
+		if err != nil {
+			return fmt.Errorf("error creating buy_user_id index: %v", err)
+		}
+
+		_, err = db.Exec("CREATE INDEX idx_transactions_sell_user_id ON transactions(sell_user_id)")
+		if err != nil {
+			return fmt.Errorf("error creating sell_user_id index: %v", err)
+		}
+
+		_, err = db.Exec("CREATE INDEX idx_transactions_stock_id ON transactions(stock_id)")
+		if err != nil {
+			return fmt.Errorf("error creating stock_id index: %v", err)
+		}
+
+		log.Println("Database schema created successfully")
+	} else {
+		log.Println("Database schema already exists")
+	}
+
+	return nil
+}
+
 func main() {
 	var err error
 
@@ -528,6 +629,12 @@ func main() {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer db.Close()
+
+	// Initialize database schema
+	err = initSchema(db)
+	if err != nil {
+		log.Fatalf("Failed to initialize database schema: %v", err)
+	}
 
 	// Initialize order book manager
 	orderBookMgr = initOrderBookManager()
