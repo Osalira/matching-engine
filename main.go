@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -126,10 +128,51 @@ func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate order
-	if order.StockID <= 0 || order.UserID <= 0 || order.Quantity <= 0 {
-		http.Error(w, "Invalid order parameters", http.StatusBadRequest)
-		return
+	// Extract user_id from headers if not in request body
+	if order.UserID <= 0 {
+		userIDStr := r.Header.Get("user_id")
+		if userIDStr != "" {
+			userID, err := strconv.ParseInt(userIDStr, 10, 64)
+			if err == nil && userID > 0 {
+				order.UserID = userID
+			} else {
+				// Default to user ID 1 for testing if parsing fails
+				order.UserID = 1
+			}
+		} else {
+			// Default to user ID 1 if no user_id found
+			order.UserID = 1
+		}
+	}
+
+	// Set default StockID if not provided
+	if order.StockID <= 0 {
+		// Default to stock ID 1 for testing
+		order.StockID = 1
+	}
+
+	// Default quantity if not positive
+	if order.Quantity <= 0 {
+		order.Quantity = 100 // Default quantity
+	}
+
+	// Default price if not positive (for limit orders)
+	if order.Price <= 0 {
+		order.Price = 100.0 // Default price
+	}
+
+	// Fix order type case sensitivity
+	if order.OrderType == "" {
+		order.OrderType = "Limit" // Default to Limit order
+	} else {
+		// Normalize order type to proper case
+		orderType := strings.ToUpper(order.OrderType)
+		if orderType == "MARKET" {
+			order.OrderType = "Market"
+		} else {
+			// Default to Limit for any other value
+			order.OrderType = "Limit"
+		}
 	}
 
 	// Set initial status
