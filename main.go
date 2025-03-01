@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -48,9 +49,10 @@ type OrderBookManager struct {
 
 // Global variables
 var (
-	db              *sql.DB
-	orderBookMgr    *OrderBookManager
-	tradingEndpoint string
+	db               *sql.DB
+	orderBookMgr     *OrderBookManager
+	tradingEndpoint  string = "http://api-gateway:4000/transaction/processTransaction" // Updated to use API Gateway
+	serviceAuthToken string                                                            // Token for service-to-service authentication
 )
 
 // Database connection
@@ -59,6 +61,14 @@ func initDB() (*sql.DB, error) {
 	err := godotenv.Load()
 	if err != nil {
 		log.Println("Warning: .env file not found")
+	}
+
+	// Get service auth token from environment variables
+	serviceAuthToken = os.Getenv("SERVICE_AUTH_TOKEN")
+	if serviceAuthToken == "" {
+		log.Println("Warning: SERVICE_AUTH_TOKEN not found in environment, service-to-service authentication may fail")
+	} else {
+		log.Println("Service authentication token loaded successfully")
 	}
 
 	// Get database connection parameters
@@ -156,11 +166,6 @@ func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
 		order.Quantity = 100 // Default quantity
 	}
 
-	// Default price if not positive (for limit orders)
-	if order.Price <= 0 {
-		order.Price = 100.0 // Default price
-	}
-
 	// Fix order type case sensitivity
 	if order.OrderType == "" {
 		order.OrderType = "Limit" // Default to Limit order
@@ -175,6 +180,15 @@ func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Default price if not positive (only for limit orders)
+	if order.OrderType == "Limit" && order.Price <= 0 {
+		order.Price = 100.0 // Default price for limit orders only
+	}
+
+	// For market orders, price is determined by matching with existing orders
+	// Market buy orders match at the lowest available sell price
+	// Market sell orders match at the highest available buy price
+
 	// Set initial status
 	order.Status = "Pending"
 	order.Timestamp = time.Now()
@@ -182,11 +196,23 @@ func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
 	// Process order
 	result, err := processOrder(order)
 	if err != nil {
+		log.Printf("Error processing order: %v", err)
 		http.Error(w, fmt.Sprintf("Error processing order: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Return response
+	// Update the order ID from the result
+	if orderID, ok := result["order_id"].(int64); ok {
+		order.ID = orderID
+	}
+	if status, ok := result["status"].(string); ok {
+		order.Status = status
+	}
+
+	// Notify trading service about the order status
+	notifyOrderStatus(order)
+
+	// Return order details
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
@@ -198,25 +224,204 @@ func processOrder(order Order) (map[string]interface{}, error) {
 	orderBook.Mutex.Lock()
 	defer orderBook.Mutex.Unlock()
 
-	// For market orders, try to match immediately
+	// Insert order into database first, regardless of type
+	var orderID int64
+	err := db.QueryRow(
+		"INSERT INTO orders (user_id, stock_id, is_buy, order_type, status, quantity, price, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+		order.UserID, order.StockID, order.IsBuy, order.OrderType, order.Status, order.Quantity, order.Price, order.Timestamp,
+	).Scan(&orderID)
+	if err != nil {
+		return nil, err
+	}
+	order.ID = orderID
+
+	// For market orders, try to match immediately at best available price
 	if order.OrderType == "Market" {
-		// TODO: Implement market order logic
-		return nil, fmt.Errorf("market orders not implemented yet")
+		// Market orders match at the best available price
+		var matches []map[string]interface{}
+		remainingQty := order.Quantity
+
+		if order.IsBuy {
+			// Buy market order - match against sell orders (sorted by lowest price first)
+			// For market buy orders, we take the lowest sell prices available
+			sellOrders := orderBook.SellOrders
+			if len(sellOrders) == 0 {
+				// No sell orders available, update status to pending
+				_, err = db.Exec("UPDATE orders SET status = 'Pending' WHERE id = $1", order.ID)
+				if err != nil {
+					return nil, err
+				}
+				order.Status = "Pending"
+
+				// Add to order book for future matching
+				orderBook.BuyOrders = append(orderBook.BuyOrders, order)
+
+				// Return status
+				return map[string]interface{}{
+					"order_id": order.ID,
+					"status":   order.Status,
+					"matches":  matches,
+				}, nil
+			}
+
+			// Sort sell orders by price (low to high) - already sorted in the order book
+			// This ensures market buy orders get the best (lowest) price
+			for i := 0; i < len(sellOrders) && remainingQty > 0; i++ {
+				sellOrder := sellOrders[i]
+
+				// Market buy orders match at the seller's asking price
+				matchQty := min(remainingQty, sellOrder.Quantity)
+
+				// Create match record
+				match := map[string]interface{}{
+					"matched_order_id": sellOrder.ID,
+					"price":            sellOrder.Price,
+					"quantity":         matchQty,
+				}
+				matches = append(matches, match)
+
+				// Update remaining quantity
+				remainingQty -= matchQty
+
+				// Update sell order quantity
+				sellOrder.Quantity -= matchQty
+				if sellOrder.Quantity == 0 {
+					// Remove sell order from book
+					orderBook.SellOrders = append(orderBook.SellOrders[:i], orderBook.SellOrders[i+1:]...)
+					i--
+
+					// Update sell order status in database
+					_, err := db.Exec("UPDATE orders SET status = 'Completed', quantity = 0 WHERE id = $1", sellOrder.ID)
+					if err != nil {
+						log.Printf("Error updating sell order: %v", err)
+					}
+				} else {
+					// Update sell order quantity in database
+					_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", sellOrder.Quantity, sellOrder.ID)
+					if err != nil {
+						log.Printf("Error updating sell order: %v", err)
+					}
+				}
+
+				// Create transaction record
+				createTransaction(order.ID, sellOrder.ID, matchQty, sellOrder.Price)
+			}
+		} else {
+			// Sell market order - match against buy orders (sorted by highest price first)
+			// For market sell orders, we take the highest buy prices available
+			buyOrders := orderBook.BuyOrders
+			if len(buyOrders) == 0 {
+				// No buy orders available, update status to pending
+				_, err = db.Exec("UPDATE orders SET status = 'Pending' WHERE id = $1", order.ID)
+				if err != nil {
+					return nil, err
+				}
+				order.Status = "Pending"
+
+				// Add to order book for future matching
+				orderBook.SellOrders = append(orderBook.SellOrders, order)
+
+				// Return status
+				return map[string]interface{}{
+					"order_id": order.ID,
+					"status":   order.Status,
+					"matches":  matches,
+				}, nil
+			}
+
+			// TODO: Sort buy orders by price (high to low) for optimal matching
+			// For now, we'll just use the existing order
+			for i := 0; i < len(buyOrders) && remainingQty > 0; i++ {
+				buyOrder := buyOrders[i]
+
+				// Market sell orders match at the buyer's bid price
+				matchQty := min(remainingQty, buyOrder.Quantity)
+
+				// Create match record
+				match := map[string]interface{}{
+					"matched_order_id": buyOrder.ID,
+					"price":            buyOrder.Price,
+					"quantity":         matchQty,
+				}
+				matches = append(matches, match)
+
+				// Update remaining quantity
+				remainingQty -= matchQty
+
+				// Update buy order quantity
+				buyOrder.Quantity -= matchQty
+				if buyOrder.Quantity == 0 {
+					// Remove buy order from book
+					orderBook.BuyOrders = append(orderBook.BuyOrders[:i], orderBook.BuyOrders[i+1:]...)
+					i--
+
+					// Update buy order status in database
+					_, err := db.Exec("UPDATE orders SET status = 'Completed', quantity = 0 WHERE id = $1", buyOrder.ID)
+					if err != nil {
+						log.Printf("Error updating buy order: %v", err)
+					}
+				} else {
+					// Update buy order quantity in database
+					_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", buyOrder.Quantity, buyOrder.ID)
+					if err != nil {
+						log.Printf("Error updating buy order: %v", err)
+					}
+				}
+
+				// Create transaction record
+				createTransaction(buyOrder.ID, order.ID, matchQty, buyOrder.Price)
+			}
+		}
+
+		// Update order status based on matches
+		if remainingQty == 0 {
+			// Fully matched
+			_, err = db.Exec("UPDATE orders SET status = 'Completed' WHERE id = $1", order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.Status = "Completed"
+		} else if len(matches) > 0 {
+			// Partially matched
+			_, err = db.Exec("UPDATE orders SET status = 'Partially_complete', quantity = $1 WHERE id = $2", remainingQty, order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.Status = "Partially_complete"
+			order.Quantity = remainingQty
+
+			// Add to order book
+			if order.IsBuy {
+				orderBook.BuyOrders = append(orderBook.BuyOrders, order)
+			} else {
+				orderBook.SellOrders = append(orderBook.SellOrders, order)
+			}
+		} else {
+			// No matches, update status to in progress
+			_, err = db.Exec("UPDATE orders SET status = 'InProgress' WHERE id = $1", order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.Status = "InProgress"
+
+			// Add to order book
+			if order.IsBuy {
+				orderBook.BuyOrders = append(orderBook.BuyOrders, order)
+			} else {
+				orderBook.SellOrders = append(orderBook.SellOrders, order)
+			}
+		}
+
+		// Prepare response
+		return map[string]interface{}{
+			"order_id": order.ID,
+			"status":   order.Status,
+			"matches":  matches,
+		}, nil
 	}
 
 	// For limit orders, try to match or add to order book
 	if order.OrderType == "Limit" {
-		// Insert order into database
-		var orderID int64
-		err := db.QueryRow(
-			"INSERT INTO orders (user_id, stock_id, is_buy, order_type, status, quantity, price, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-			order.UserID, order.StockID, order.IsBuy, order.OrderType, order.Status, order.Quantity, order.Price, order.Timestamp,
-		).Scan(&orderID)
-		if err != nil {
-			return nil, err
-		}
-		order.ID = orderID
-
 		// Try to match order
 		matches, remainingQty := matchLimitOrder(order)
 
@@ -406,35 +611,135 @@ func createTransaction(buyOrderID, sellOrderID int64, quantity int, price float6
 
 // Notify trading service about a completed transaction
 func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int, price float64) {
-	// Create notification payload
-	payload := map[string]interface{}{
+	// Prepare request
+	transactionData := map[string]interface{}{
 		"buy_user_id":  buyUserID,
 		"sell_user_id": sellUserID,
 		"stock_id":     stockID,
 		"quantity":     quantity,
 		"price":        price,
-		"timestamp":    time.Now(),
+		"timestamp":    time.Now().Format(time.RFC3339),
 	}
 
-	// Convert to JSON
-	jsonPayload, err := json.Marshal(payload)
+	jsonData, err := json.Marshal(transactionData)
 	if err != nil {
-		log.Printf("Error creating notification payload: %v", err)
+		log.Printf("Error marshaling transaction data: %v", err)
 		return
 	}
 
-	// Send to trading service
-	resp, err := http.Post(tradingEndpoint+"/api/transaction/processTransaction", "application/json", bytes.NewBuffer(jsonPayload))
+	// Get trading service URL from environment or use default
+	endpoint := os.Getenv("TRADING_SERVICE_URL")
+	if endpoint == "" {
+		endpoint = tradingEndpoint
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("Error notifying trading service: %v", err)
+		log.Printf("Error creating HTTP request: %v", err)
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("user_id", "0")                      // System user ID for service-to-service authentication
+	req.Header.Set("X-REQUEST-FROM", "matching-engine") // Identify as matching engine
+
+	// Add authentication token if available
+	if serviceAuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+serviceAuthToken)
+		log.Printf("Added service authentication token to request (first 10 chars): %s...", serviceAuthToken[:10])
+	} else {
+		log.Println("Warning: No service authentication token found")
+	}
+
+	// Send request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error sending request to trading service: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Check response
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Trading service returned non-OK status: %d", resp.StatusCode)
+	// Read response
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading response from trading service: %v", err)
+		return
 	}
+
+	log.Printf("Order notification response (status %d): %s", resp.StatusCode, string(respBody))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Non-OK response from trading service: %d", resp.StatusCode)
+	}
+}
+
+// Notify trading service about an order status
+func notifyOrderStatus(order Order) {
+	// Prepare request data
+	orderData := map[string]interface{}{
+		"user_id":    order.UserID,
+		"stock_id":   order.StockID,
+		"is_buy":     order.IsBuy,
+		"order_type": order.OrderType,
+		"status":     order.Status,
+		"quantity":   order.Quantity,
+		"price":      order.Price,
+		"timestamp":  order.Timestamp.Format(time.RFC3339),
+		"order_id":   order.ID,
+	}
+
+	jsonData, err := json.Marshal(orderData)
+	if err != nil {
+		log.Printf("Error marshaling order data: %v", err)
+		return
+	}
+
+	// Get trading service URL from environment or use default
+	endpoint := os.Getenv("TRADING_SERVICE_URL")
+	if endpoint == "" {
+		endpoint = tradingEndpoint
+	}
+
+	// Create HTTP request - use processOrderStatus endpoint
+	statusEndpoint := strings.Replace(endpoint, "processTransaction", "processOrderStatus", 1)
+	req, err := http.NewRequest("POST", statusEndpoint, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Error creating HTTP request: %v", err)
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("user_id", strconv.FormatInt(order.UserID, 10)) // Pass user ID for authentication
+	req.Header.Set("X-REQUEST-FROM", "matching-engine")            // Identify as matching engine
+
+	// Add authentication token if available
+	if serviceAuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+serviceAuthToken)
+	} else {
+		log.Println("Warning: No service authentication token found")
+	}
+
+	// Send request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error sending order status update to trading service: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading order status response: %v", err)
+		return
+	}
+
+	log.Printf("Order status notification response: %s", string(respBody))
 }
 
 // Handler for cancelling a stock order
@@ -642,8 +947,10 @@ func main() {
 	// Set trading service endpoint
 	tradingEndpoint = os.Getenv("TRADING_SERVICE_URL")
 	if tradingEndpoint == "" {
-		tradingEndpoint = "http://trading-service:8000"
+		log.Println("Warning: TRADING_SERVICE_URL not found in environment, using default URL")
+		tradingEndpoint = "http://api-gateway:4000/transaction/processTransaction"
 	}
+	log.Printf("Using trading service endpoint: %s", tradingEndpoint)
 
 	// Create router
 	r := mux.NewRouter()
