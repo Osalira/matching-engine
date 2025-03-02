@@ -51,7 +51,7 @@ type OrderBookManager struct {
 var (
 	db               *sql.DB
 	orderBookMgr     *OrderBookManager
-	tradingEndpoint  string = "http://api-gateway:4000/transaction/processTransaction" // Updated to use API Gateway
+	tradingEndpoint  string = "http://api-gateway:5000/transaction/processTransaction" // Updated to use API Gateway with port 5000
 	serviceAuthToken string                                                            // Token for service-to-service authentication
 )
 
@@ -128,6 +128,92 @@ func (mgr *OrderBookManager) GetOrderBook(stockID int64) *OrderBook {
 	return ob
 }
 
+// Get the best sell price for a stock (lowest price)
+func getBestSellPrice(stockID int64) (float64, bool) {
+	orderBook := orderBookMgr.GetOrderBook(stockID)
+	orderBook.Mutex.Lock()
+	defer orderBook.Mutex.Unlock()
+
+	// If there are no sell orders, return 0 and false
+	if len(orderBook.SellOrders) == 0 {
+		return 0, false
+	}
+
+	// Find the lowest priced sell order
+	bestPrice := orderBook.SellOrders[0].Price
+	for _, order := range orderBook.SellOrders {
+		if order.Price < bestPrice {
+			bestPrice = order.Price
+		}
+	}
+
+	return bestPrice, true
+}
+
+// Notify trading service about a price update
+func notifyPriceUpdate(stockID int64, price float64) {
+	// Prepare request data
+	priceData := map[string]interface{}{
+		"stock_id":      stockID,
+		"current_price": price,
+	}
+
+	// Wrap in an array as expected by the API
+	priceDataArray := []map[string]interface{}{priceData}
+
+	jsonData, err := json.Marshal(priceDataArray)
+	if err != nil {
+		log.Printf("Error marshaling price data: %v", err)
+		return
+	}
+
+	// Use the API Gateway with the correct port (5000, not 4000)
+	// and path (/setup/updateStockPrices)
+	priceEndpoint := "http://api-gateway:5000/setup/updateStockPrices"
+	log.Printf("Using price update endpoint: %s", priceEndpoint)
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", priceEndpoint, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Error creating HTTP request: %v", err)
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-REQUEST-FROM", "matching-engine") // Identify as matching engine
+
+	// Add authentication token if available
+	if serviceAuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+serviceAuthToken)
+		log.Printf("Added service authentication token to price update request")
+	} else {
+		log.Println("Warning: No service authentication token found")
+	}
+
+	// Send request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error sending price update to trading service: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading price update response: %v", err)
+		return
+	}
+
+	log.Printf("Price update response (status %d): %s", resp.StatusCode, string(respBody))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Non-OK response from trading service for price update: %d", resp.StatusCode)
+	}
+}
+
 // Handler for placing a stock order
 func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse request body
@@ -149,51 +235,26 @@ func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
 				// Default to user ID 1 for testing if parsing fails
 				order.UserID = 1
 			}
-		} else {
-			// Default to user ID 1 if no user_id found
-			order.UserID = 1
 		}
 	}
 
-	// Set default StockID if not provided
+	// Set default stock ID if not provided
 	if order.StockID <= 0 {
-		// Default to stock ID 1 for testing
-		order.StockID = 1
+		order.StockID = 1 // Default to first stock for testing
 	}
 
-	// Default quantity if not positive
-	if order.Quantity <= 0 {
-		order.Quantity = 100 // Default quantity
-	}
-
-	// Fix order type case sensitivity
-	if order.OrderType == "" {
-		order.OrderType = "Limit" // Default to Limit order
+	// Normalize order type to title case
+	if strings.ToLower(order.OrderType) == "market" {
+		order.OrderType = "Market"
 	} else {
-		// Normalize order type to proper case
-		orderType := strings.ToUpper(order.OrderType)
-		if orderType == "MARKET" {
-			order.OrderType = "Market"
-		} else {
-			// Default to Limit for any other value
-			order.OrderType = "Limit"
-		}
+		order.OrderType = "Limit" // Default to Limit order
 	}
 
-	// Default price if not positive (only for limit orders)
-	if order.OrderType == "Limit" && order.Price <= 0 {
-		order.Price = 100.0 // Default price for limit orders only
-	}
-
-	// For market orders, price is determined by matching with existing orders
-	// Market buy orders match at the lowest available sell price
-	// Market sell orders match at the highest available buy price
-
-	// Set initial status
-	order.Status = "Pending"
+	// Set the initial status and timestamp
+	order.Status = "InProgress"
 	order.Timestamp = time.Now()
 
-	// Process order
+	// Process the order
 	result, err := processOrder(order)
 	if err != nil {
 		log.Printf("Error processing order: %v", err)
@@ -211,6 +272,18 @@ func placeOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Notify trading service about the order status
 	notifyOrderStatus(order)
+
+	// If this is a sell order, check if we should update the stock price
+	if !order.IsBuy {
+		// Only update price if this is a sell order
+		bestPrice, exists := getBestSellPrice(order.StockID)
+		if exists {
+			log.Printf("Updating price for stock %d to best sell price: %f", order.StockID, bestPrice)
+			notifyPriceUpdate(order.StockID, bestPrice)
+		} else {
+			log.Printf("No sell orders available for stock %d after placing order", order.StockID)
+		}
+	}
 
 	// Return order details
 	w.Header().Set("Content-Type", "application/json")
@@ -680,15 +753,81 @@ func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int, pr
 func notifyOrderStatus(order Order) {
 	// Prepare request data
 	orderData := map[string]interface{}{
-		"user_id":    order.UserID,
-		"stock_id":   order.StockID,
-		"is_buy":     order.IsBuy,
-		"order_type": order.OrderType,
-		"status":     order.Status,
-		"quantity":   order.Quantity,
-		"price":      order.Price,
-		"timestamp":  order.Timestamp.Format(time.RFC3339),
-		"order_id":   order.ID,
+		"user_id":           order.UserID,
+		"stock_id":          order.StockID,
+		"is_buy":            order.IsBuy,
+		"order_type":        order.OrderType,
+		"status":            order.Status,
+		"quantity":          order.Quantity,
+		"price":             order.Price,
+		"timestamp":         order.Timestamp.Format(time.RFC3339),
+		"order_id":          order.ID,
+		"notification_type": "new_order",
+	}
+
+	// Add matches data if this is a completed market order with price=0
+	if order.OrderType == "Market" && (order.Status == "Completed" || order.Status == "Partially_complete") {
+		// Fetch the transaction to get the actual execution price
+		var actualPrice float64
+		var matchRows *sql.Rows
+		var err error
+
+		if order.IsBuy {
+			matchRows, err = db.Query(
+				"SELECT price FROM transactions WHERE buy_order_id = $1 ORDER BY timestamp DESC",
+				order.ID,
+			)
+		} else {
+			matchRows, err = db.Query(
+				"SELECT price FROM transactions WHERE sell_order_id = $1 ORDER BY timestamp DESC",
+				order.ID,
+			)
+		}
+
+		if err != nil {
+			log.Printf("Error querying transactions for order %d: %v", order.ID, err)
+		} else {
+			defer matchRows.Close()
+
+			matches := []map[string]interface{}{}
+			totalQuantity := 0
+
+			for matchRows.Next() {
+				err := matchRows.Scan(&actualPrice)
+				if err != nil {
+					log.Printf("Error scanning transaction price: %v", err)
+					continue
+				}
+
+				if actualPrice > 0 {
+					// Determine the quantity for this match (for simplicity using the full quantity here)
+					matchQuantity := order.Quantity
+					if totalQuantity+matchQuantity > order.Quantity {
+						matchQuantity = order.Quantity - totalQuantity
+					}
+
+					// Create a match entry with the actual execution price
+					match := map[string]interface{}{
+						"matched_order_id": 0, // We don't track the matched order ID in this context
+						"price":            actualPrice,
+						"quantity":         matchQuantity,
+					}
+					matches = append(matches, match)
+					totalQuantity += matchQuantity
+
+					log.Printf("Adding match with price %f for order %d", actualPrice, order.ID)
+				}
+			}
+
+			// Add matches array if we found valid matches
+			if len(matches) > 0 {
+				orderData["matches"] = matches
+				// Update the price in the notification to the actual price
+				// This helps the trading service create the wallet transaction with the correct amount
+				orderData["price"] = actualPrice
+				log.Printf("Updated order notification for market order %d with match price %f", order.ID, actualPrice)
+			}
+		}
 	}
 
 	jsonData, err := json.Marshal(orderData)
@@ -727,7 +866,7 @@ func notifyOrderStatus(order Order) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Error sending order status update to trading service: %v", err)
+		log.Printf("Error sending order status to trading service: %v", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -735,11 +874,15 @@ func notifyOrderStatus(order Order) {
 	// Read response
 	respBody, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("Error reading order status response: %v", err)
+		log.Printf("Error reading response from trading service: %v", err)
 		return
 	}
 
-	log.Printf("Order status notification response: %s", string(respBody))
+	log.Printf("Order status notification response (status %d): %s", resp.StatusCode, string(respBody))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Non-OK response from trading service: %d", resp.StatusCode)
+	}
 }
 
 // Handler for cancelling a stock order
@@ -948,7 +1091,7 @@ func main() {
 	tradingEndpoint = os.Getenv("TRADING_SERVICE_URL")
 	if tradingEndpoint == "" {
 		log.Println("Warning: TRADING_SERVICE_URL not found in environment, using default URL")
-		tradingEndpoint = "http://api-gateway:4000/transaction/processTransaction"
+		tradingEndpoint = "http://api-gateway:5000/transaction/processTransaction"
 	}
 	log.Printf("Using trading service endpoint: %s", tradingEndpoint)
 
