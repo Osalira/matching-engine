@@ -889,7 +889,7 @@ func notifyOrderStatus(order Order) {
 func cancelOrderHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse request body
 	var data struct {
-		TransactionID int64 `json:"transaction_id"`
+		TransactionID string `json:"transaction_id"`
 	}
 	err := json.NewDecoder(r.Body).Decode(&data)
 	if err != nil {
@@ -897,12 +897,19 @@ func cancelOrderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Convert string transaction_id to int64
+	transactionID, err := strconv.ParseInt(data.TransactionID, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid transaction ID format: must be a valid number", http.StatusBadRequest)
+		return
+	}
+
 	// Get order details
 	var order Order
 	err = db.QueryRow(
-		"SELECT id, user_id, stock_id, is_buy, order_type, status, quantity, price FROM orders WHERE id = $1",
-		data.TransactionID,
-	).Scan(&order.ID, &order.UserID, &order.StockID, &order.IsBuy, &order.OrderType, &order.Status, &order.Quantity, &order.Price)
+		"SELECT id, user_id, stock_id, is_buy, order_type, status, quantity, price, timestamp FROM orders WHERE id = $1",
+		transactionID,
+	).Scan(&order.ID, &order.UserID, &order.StockID, &order.IsBuy, &order.OrderType, &order.Status, &order.Quantity, &order.Price, &order.Timestamp)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			http.Error(w, "Order not found", http.StatusNotFound)
@@ -944,6 +951,12 @@ func cancelOrderHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	orderBook.Mutex.Unlock()
+
+	// Update the order status to Cancelled
+	order.Status = "Cancelled"
+
+	// Notify trading service about the cancellation
+	go notifyOrderStatus(order)
 
 	// Return success response
 	w.Header().Set("Content-Type", "application/json")
