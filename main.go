@@ -973,11 +973,29 @@ func min(a, b int) int {
 
 // Health check handler
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("Health check requested")
+
+	// Check database connection
+	err := db.Ping()
+	if err != nil {
+		log.Printf("Health check failed: %v", err)
+		http.Error(w, "Database connection failed", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Check if orders table exists
+	var exists bool
+	err = db.QueryRow("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'orders')").Scan(&exists)
+	if err != nil || !exists {
+		log.Printf("Health check failed: orders table not found or error: %v", err)
+		http.Error(w, "Database schema is incomplete", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Return healthy response
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "healthy",
-		"service": "matching-engine",
-	})
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"healthy","message":"Matching engine is running properly"}`))
 }
 
 // Initialize the database schema
