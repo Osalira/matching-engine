@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o matching-engine .
 FROM alpine:latest
 
 # Install runtime dependencies
-RUN apk --no-cache add ca-certificates tzdata postgresql-client bash
+RUN apk --no-cache add ca-certificates tzdata postgresql-client bash dos2unix
 
 # Create non-root user
 RUN adduser -D -g '' appuser
@@ -35,8 +35,13 @@ WORKDIR /app
 COPY --from=builder /app/matching-engine .
 
 # Copy wait-for-db script and schema
-COPY wait-for-db.sh schema.sql ./
-RUN chmod +x wait-for-db.sh
+COPY wait-for-db.sh init-db.sh schema.sql ./
+
+# Fix script permissions and ensure Unix line endings
+RUN chmod +x *.sh && \
+    dos2unix *.sh && \
+    echo "Script permissions: $(ls -la *.sh)" && \
+    echo "Build timestamp: $(date)"
 
 # Create logs directory
 RUN mkdir -p logs && chown -R appuser:appuser /app
