@@ -10,7 +10,7 @@ CREATE TABLE orders (
     is_buy BOOLEAN NOT NULL,
     order_type VARCHAR(20) NOT NULL,
     status VARCHAR(20) NOT NULL,
-    quantity INTEGER NOT NULL,
+    quantity BIGINT NOT NULL,
     price DECIMAL(10, 2) NOT NULL,
     timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     parent_order_id INTEGER REFERENCES orders(id)
@@ -29,7 +29,7 @@ CREATE TABLE transactions (
     buy_user_id INTEGER NOT NULL,
     sell_user_id INTEGER NOT NULL,
     stock_id INTEGER NOT NULL,
-    quantity INTEGER NOT NULL,
+    quantity BIGINT NOT NULL,
     price DECIMAL(10, 2) NOT NULL,
     timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

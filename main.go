@@ -27,7 +27,7 @@ type Order struct {
 	IsBuy         bool      `json:"is_buy"`
 	OrderType     string    `json:"order_type"`
 	Status        string    `json:"status"`
-	Quantity      int       `json:"quantity"`
+	Quantity      int64     `json:"quantity"`
 	Price         float64   `json:"price"`
 	Timestamp     time.Time `json:"timestamp"`
 	ParentOrderID *int64    `json:"parent_order_id,omitempty"`
@@ -550,7 +550,7 @@ func processOrder(order Order) (map[string]interface{}, error) {
 }
 
 // Match a limit order against the order book
-func matchLimitOrder(order Order) ([]map[string]interface{}, int) {
+func matchLimitOrder(order Order) ([]map[string]interface{}, int64) {
 	orderBook := orderBookMgr.GetOrderBook(order.StockID)
 	var matches []map[string]interface{}
 	remainingQty := order.Quantity
@@ -651,7 +651,7 @@ func matchLimitOrder(order Order) ([]map[string]interface{}, int) {
 }
 
 // Create a transaction record for matched orders
-func createTransaction(buyOrderID, sellOrderID int64, quantity int, price float64) {
+func createTransaction(buyOrderID, sellOrderID int64, quantity int64, price float64) {
 	// Get buy order details
 	var buyOrder Order
 	err := db.QueryRow("SELECT user_id, stock_id FROM orders WHERE id = $1", buyOrderID).Scan(&buyOrder.UserID, &buyOrder.StockID)
@@ -683,7 +683,7 @@ func createTransaction(buyOrderID, sellOrderID int64, quantity int, price float6
 }
 
 // Notify trading service about a completed transaction
-func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int, price float64) {
+func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int64, price float64) {
 	// Prepare request
 	transactionData := map[string]interface{}{
 		"buy_user_id":  buyUserID,
@@ -790,7 +790,7 @@ func notifyOrderStatus(order Order) {
 			defer matchRows.Close()
 
 			matches := []map[string]interface{}{}
-			totalQuantity := 0
+			totalQuantity := int64(0)
 
 			for matchRows.Next() {
 				err := matchRows.Scan(&actualPrice)
@@ -964,7 +964,7 @@ func cancelOrderHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Helper function for min
-func min(a, b int) int {
+func min(a, b int64) int64 {
 	if a < b {
 		return a
 	}
