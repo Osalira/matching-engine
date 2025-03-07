@@ -551,99 +551,148 @@ func processOrder(order Order) (map[string]interface{}, error) {
 
 // Match a limit order against the order book
 func matchLimitOrder(order Order) ([]map[string]interface{}, int64) {
-	orderBook := orderBookMgr.GetOrderBook(order.StockID)
-	var matches []map[string]interface{}
+	matches := []map[string]interface{}{}
 	remainingQty := order.Quantity
 
 	if order.IsBuy {
 		// Buy order - match against sell orders
-		for i := 0; i < len(orderBook.SellOrders) && remainingQty > 0; i++ {
-			sellOrder := orderBook.SellOrders[i]
-
-			// Check if sell order price is less than or equal to buy price
-			if sellOrder.Price <= order.Price {
-				// Match the orders
-				matchQty := min(remainingQty, sellOrder.Quantity)
-
-				// Create match record
-				match := map[string]interface{}{
-					"matched_order_id": sellOrder.ID,
-					"price":            sellOrder.Price,
-					"quantity":         matchQty,
-				}
-				matches = append(matches, match)
-
-				// Update remaining quantity
-				remainingQty -= matchQty
-
-				// Update sell order quantity
-				sellOrder.Quantity -= matchQty
-				if sellOrder.Quantity == 0 {
-					// Remove sell order from book
-					orderBook.SellOrders = append(orderBook.SellOrders[:i], orderBook.SellOrders[i+1:]...)
-					i--
-
-					// Update sell order status in database
-					_, err := db.Exec("UPDATE orders SET status = 'Completed', quantity = 0 WHERE id = $1", sellOrder.ID)
-					if err != nil {
-						log.Printf("Error updating sell order: %v", err)
-					}
-				} else {
-					// Update sell order quantity in database
-					_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", sellOrder.Quantity, sellOrder.ID)
-					if err != nil {
-						log.Printf("Error updating sell order: %v", err)
-					}
-				}
-
-				// Create transaction record
-				createTransaction(order.ID, sellOrder.ID, matchQty, sellOrder.Price)
+		sellOrders := orderBookMgr.GetOrderBook(order.StockID).SellOrders
+		for _, sellOrder := range sellOrders {
+			if remainingQty <= 0 || order.Price < sellOrder.Price {
+				break
 			}
+
+			// Match the orders
+			matchQty := min(remainingQty, sellOrder.Quantity)
+			match := map[string]interface{}{
+				"order_id":         order.ID,
+				"matched_order_id": sellOrder.ID,
+				"quantity":         matchQty,
+				"price":            sellOrder.Price,
+			}
+			matches = append(matches, match)
+
+			// Update the sell order quantity
+			newSellQty := sellOrder.Quantity - matchQty
+			if newSellQty == 0 {
+				// Sell order fully matched
+				updateOrderStatus(sellOrder.ID, "Completed")
+			} else {
+				// Sell order partially matched
+				updateOrderStatus(sellOrder.ID, "Partially_complete")
+				_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", newSellQty, sellOrder.ID)
+				if err != nil {
+					log.Printf("Error updating sell order quantity: %v", err)
+				}
+			}
+
+			// Create a transaction record
+			createTransaction(order.ID, sellOrder.ID, matchQty, sellOrder.Price)
+
+			// Publish order.matched event
+			// Get stock symbol
+			var stockSymbol string
+			err := db.QueryRow("SELECT symbol FROM stocks WHERE id = $1", order.StockID).Scan(&stockSymbol)
+			if err != nil {
+				log.Printf("Error getting stock symbol: %v", err)
+				stockSymbol = fmt.Sprintf("stock-%d", order.StockID)
+			}
+
+			// Create event data
+			matchEventData := map[string]interface{}{
+				"event_type":    "order.matched",
+				"buy_order_id":  order.ID,
+				"sell_order_id": sellOrder.ID,
+				"buy_user_id":   order.UserID,
+				"sell_user_id":  sellOrder.UserID,
+				"stock_id":      order.StockID,
+				"stock_symbol":  stockSymbol,
+				"quantity":      matchQty,
+				"price":         sellOrder.Price,
+				"matched_at":    time.Now().Format(time.RFC3339),
+				"total_value":   sellOrder.Price * float64(matchQty),
+			}
+
+			// Publish event
+			err = PublishEvent("order_events", "order.matched", matchEventData)
+			if err != nil {
+				log.Printf("Warning: Failed to publish order.matched event: %v", err)
+			} else {
+				log.Printf("Published order.matched event for buy order %d and sell order %d", order.ID, sellOrder.ID)
+			}
+
+			// Update remaining quantity
+			remainingQty -= matchQty
 		}
 	} else {
 		// Sell order - match against buy orders
-		for i := 0; i < len(orderBook.BuyOrders) && remainingQty > 0; i++ {
-			buyOrder := orderBook.BuyOrders[i]
-
-			// Check if buy order price is greater than or equal to sell price
-			if buyOrder.Price >= order.Price {
-				// Match the orders
-				matchQty := min(remainingQty, buyOrder.Quantity)
-
-				// Create match record
-				match := map[string]interface{}{
-					"matched_order_id": buyOrder.ID,
-					"price":            buyOrder.Price,
-					"quantity":         matchQty,
-				}
-				matches = append(matches, match)
-
-				// Update remaining quantity
-				remainingQty -= matchQty
-
-				// Update buy order quantity
-				buyOrder.Quantity -= matchQty
-				if buyOrder.Quantity == 0 {
-					// Remove buy order from book
-					orderBook.BuyOrders = append(orderBook.BuyOrders[:i], orderBook.BuyOrders[i+1:]...)
-					i--
-
-					// Update buy order status in database
-					_, err := db.Exec("UPDATE orders SET status = 'Completed', quantity = 0 WHERE id = $1", buyOrder.ID)
-					if err != nil {
-						log.Printf("Error updating buy order: %v", err)
-					}
-				} else {
-					// Update buy order quantity in database
-					_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", buyOrder.Quantity, buyOrder.ID)
-					if err != nil {
-						log.Printf("Error updating buy order: %v", err)
-					}
-				}
-
-				// Create transaction record
-				createTransaction(buyOrder.ID, order.ID, matchQty, buyOrder.Price)
+		buyOrders := orderBookMgr.GetOrderBook(order.StockID).BuyOrders
+		for _, buyOrder := range buyOrders {
+			if remainingQty <= 0 || order.Price > buyOrder.Price {
+				break
 			}
+
+			// Match the orders
+			matchQty := min(remainingQty, buyOrder.Quantity)
+			match := map[string]interface{}{
+				"order_id":         order.ID,
+				"matched_order_id": buyOrder.ID,
+				"quantity":         matchQty,
+				"price":            buyOrder.Price,
+			}
+			matches = append(matches, match)
+
+			// Update the buy order quantity
+			newBuyQty := buyOrder.Quantity - matchQty
+			if newBuyQty == 0 {
+				// Buy order fully matched
+				updateOrderStatus(buyOrder.ID, "Completed")
+			} else {
+				// Buy order partially matched
+				updateOrderStatus(buyOrder.ID, "Partially_complete")
+				_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", newBuyQty, buyOrder.ID)
+				if err != nil {
+					log.Printf("Error updating buy order quantity: %v", err)
+				}
+			}
+
+			// Create a transaction record
+			createTransaction(buyOrder.ID, order.ID, matchQty, buyOrder.Price)
+
+			// Publish order.matched event
+			// Get stock symbol
+			var stockSymbol string
+			err := db.QueryRow("SELECT symbol FROM stocks WHERE id = $1", order.StockID).Scan(&stockSymbol)
+			if err != nil {
+				log.Printf("Error getting stock symbol: %v", err)
+				stockSymbol = fmt.Sprintf("stock-%d", order.StockID)
+			}
+
+			// Create event data
+			matchEventData := map[string]interface{}{
+				"event_type":    "order.matched",
+				"buy_order_id":  buyOrder.ID,
+				"sell_order_id": order.ID,
+				"buy_user_id":   buyOrder.UserID,
+				"sell_user_id":  order.UserID,
+				"stock_id":      order.StockID,
+				"stock_symbol":  stockSymbol,
+				"quantity":      matchQty,
+				"price":         buyOrder.Price,
+				"matched_at":    time.Now().Format(time.RFC3339),
+				"total_value":   buyOrder.Price * float64(matchQty),
+			}
+
+			// Publish event
+			err = PublishEvent("order_events", "order.matched", matchEventData)
+			if err != nil {
+				log.Printf("Warning: Failed to publish order.matched event: %v", err)
+			} else {
+				log.Printf("Published order.matched event for buy order %d and sell order %d", buyOrder.ID, order.ID)
+			}
+
+			// Update remaining quantity
+			remainingQty -= matchQty
 		}
 	}
 
@@ -1099,13 +1148,38 @@ func initSchema(db *sql.DB) error {
 	return nil
 }
 
+// Function to update order status
+func updateOrderStatus(orderID int64, status string) error {
+	// Update the order status
+	_, err := db.Exec("UPDATE orders SET status = $1 WHERE id = $2", status, orderID)
+	if err != nil {
+		return fmt.Errorf("error updating order status: %w", err)
+	}
+
+	log.Printf("Updated order %d status to %s", orderID, status)
+	return nil
+}
+
 func main() {
-	var err error
+	// Load environment variables
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: Error loading .env file:", err)
+	}
+
+	// Initialize RabbitMQ
+	err = InitRabbitMQ()
+	if err != nil {
+		log.Println("Warning: Failed to initialize RabbitMQ:", err)
+	} else {
+		log.Println("RabbitMQ initialized successfully")
+		defer rabbitMQClient.Close()
+	}
 
 	// Initialize database
 	db, err = initDB()
 	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		log.Fatal("Error initializing database:", err)
 	}
 	defer db.Close()
 
