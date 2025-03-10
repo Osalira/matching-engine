@@ -1160,6 +1160,89 @@ func updateOrderStatus(orderID int64, status string) error {
 	return nil
 }
 
+// Handler to get pending orders for a user
+func pendingOrdersHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract user_id from query parameters or headers
+	userIDStr := r.URL.Query().Get("user_id")
+	if userIDStr == "" {
+		userIDStr = r.Header.Get("user_id")
+	}
+
+	// If no user_id provided, return error
+	if userIDStr == "" {
+		http.Error(w, "Missing user_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Convert user_id to int64
+	userID, err := strconv.ParseInt(userIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid user_id format", http.StatusBadRequest)
+		return
+	}
+
+	// Query database for pending orders for this user
+	rows, err := db.Query(
+		"SELECT id, user_id, stock_id, is_buy, order_type, status, quantity, price, timestamp FROM orders WHERE user_id = $1 AND status IN ('Pending', 'InProgress', 'Partially_complete')",
+		userID,
+	)
+	if err != nil {
+		log.Printf("Error querying pending orders: %v", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	// Convert rows to Order objects
+	orders := []Order{}
+	for rows.Next() {
+		var order Order
+		var timestampStr string
+
+		err := rows.Scan(
+			&order.ID,
+			&order.UserID,
+			&order.StockID,
+			&order.IsBuy,
+			&order.OrderType,
+			&order.Status,
+			&order.Quantity,
+			&order.Price,
+			&timestampStr,
+		)
+		if err != nil {
+			log.Printf("Error scanning order row: %v", err)
+			continue
+		}
+
+		// Parse timestamp
+		timestamp, err := time.Parse(time.RFC3339, timestampStr)
+		if err != nil {
+			log.Printf("Error parsing timestamp: %v", err)
+			// Use current time as fallback
+			timestamp = time.Now()
+		}
+		order.Timestamp = timestamp
+
+		orders = append(orders, order)
+	}
+
+	// Check for errors from iterating over rows
+	if err = rows.Err(); err != nil {
+		log.Printf("Error iterating rows: %v", err)
+		http.Error(w, "Error reading orders", http.StatusInternalServerError)
+		return
+	}
+
+	// Return orders as JSON
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]interface{}{
+		"user_id": userID,
+		"orders":  orders,
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
 func main() {
 	// Load environment variables
 	err := godotenv.Load()
@@ -1207,6 +1290,7 @@ func main() {
 	r.HandleFunc("/health", healthCheckHandler).Methods("GET")
 	r.HandleFunc("/api/placeStockOrder", placeOrderHandler).Methods("POST")
 	r.HandleFunc("/api/cancelStockTransaction", cancelOrderHandler).Methods("POST")
+	r.HandleFunc("/api/pendingOrders", pendingOrdersHandler).Methods("GET")
 
 	// Start server
 	port := os.Getenv("PORT")
