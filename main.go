@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -53,6 +54,7 @@ var (
 	orderBookMgr     *OrderBookManager
 	tradingEndpoint  string = "http://api-gateway:5000/transaction/processTransaction" // Updated to use API Gateway with port 5000
 	serviceAuthToken string                                                            // Token for service-to-service authentication
+	// apiGatewayHost  string = "api-gateway:5000"                                                            // Use service name and port from Docker Compose
 )
 
 // Database connection
@@ -211,6 +213,18 @@ func notifyPriceUpdate(stockID int64, price float64) {
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Non-OK response from trading service for price update: %d", resp.StatusCode)
+	}
+}
+
+// Helper function to add service authentication token to requests
+func addServiceAuthToken(req *http.Request) {
+	// Get service auth token from environment
+	token := os.Getenv("SERVICE_AUTH_TOKEN")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+		log.Printf("Added service authentication token to request (first 10 chars): %s...", token[:10])
+	} else {
+		log.Println("Warning: No SERVICE_AUTH_TOKEN environment variable found")
 	}
 }
 
@@ -578,11 +592,35 @@ func matchLimitOrder(order Order) ([]map[string]interface{}, int64) {
 				// Sell order fully matched
 				updateOrderStatus(sellOrder.ID, "Completed")
 			} else {
-				// Sell order partially matched
+				// Sell order partially matched - ENHANCED LOGIC
+				// Update original sell order status and remaining quantity
 				updateOrderStatus(sellOrder.ID, "Partially_complete")
 				_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", newSellQty, sellOrder.ID)
 				if err != nil {
 					log.Printf("Error updating sell order quantity: %v", err)
+				}
+
+				// Create a child transaction record for the completed portion
+				var childOrderID int64
+				err = db.QueryRow(
+					"INSERT INTO orders (user_id, stock_id, is_buy, order_type, status, quantity, price, timestamp, parent_order_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+					sellOrder.UserID,
+					order.StockID,
+					false, // is_buy = false (sell order)
+					sellOrder.OrderType,
+					"Completed", // Status is completed for this portion
+					matchQty,    // Only the matched quantity
+					sellOrder.Price,
+					time.Now(),
+					sellOrder.ID, // Set parent order ID
+				).Scan(&childOrderID)
+
+				if err != nil {
+					log.Printf("Error creating child order for partial sell match: %v", err)
+				} else {
+					log.Printf("Created child order %d for partial sell match of order %d", childOrderID, sellOrder.ID)
+					// Add child order ID to the match data
+					match["child_order_id"] = childOrderID
 				}
 			}
 
@@ -648,11 +686,35 @@ func matchLimitOrder(order Order) ([]map[string]interface{}, int64) {
 				// Buy order fully matched
 				updateOrderStatus(buyOrder.ID, "Completed")
 			} else {
-				// Buy order partially matched
+				// Buy order partially matched - ENHANCED LOGIC
+				// Update original buy order status and remaining quantity
 				updateOrderStatus(buyOrder.ID, "Partially_complete")
 				_, err := db.Exec("UPDATE orders SET quantity = $1 WHERE id = $2", newBuyQty, buyOrder.ID)
 				if err != nil {
 					log.Printf("Error updating buy order quantity: %v", err)
+				}
+
+				// Create a child transaction record for the completed portion
+				var childOrderID int64
+				err = db.QueryRow(
+					"INSERT INTO orders (user_id, stock_id, is_buy, order_type, status, quantity, price, timestamp, parent_order_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+					buyOrder.UserID,
+					order.StockID,
+					true, // is_buy = true (buy order)
+					buyOrder.OrderType,
+					"Completed", // Status is completed for this portion
+					matchQty,    // Only the matched quantity
+					buyOrder.Price,
+					time.Now(),
+					buyOrder.ID, // Set parent order ID
+				).Scan(&childOrderID)
+
+				if err != nil {
+					log.Printf("Error creating child order for partial buy match: %v", err)
+				} else {
+					log.Printf("Created child order %d for partial buy match of order %d", childOrderID, buyOrder.ID)
+					// Add child order ID to the match data
+					match["child_order_id"] = childOrderID
 				}
 			}
 
@@ -703,7 +765,7 @@ func matchLimitOrder(order Order) ([]map[string]interface{}, int64) {
 func createTransaction(buyOrderID, sellOrderID int64, quantity int64, price float64) {
 	// Get buy order details
 	var buyOrder Order
-	err := db.QueryRow("SELECT user_id, stock_id FROM orders WHERE id = $1", buyOrderID).Scan(&buyOrder.UserID, &buyOrder.StockID)
+	err := db.QueryRow("SELECT user_id, stock_id, quantity FROM orders WHERE id = $1", buyOrderID).Scan(&buyOrder.UserID, &buyOrder.StockID, &buyOrder.Quantity)
 	if err != nil {
 		log.Printf("Error getting buy order details: %v", err)
 		return
@@ -711,11 +773,14 @@ func createTransaction(buyOrderID, sellOrderID int64, quantity int64, price floa
 
 	// Get sell order details
 	var sellOrder Order
-	err = db.QueryRow("SELECT user_id FROM orders WHERE id = $1", sellOrderID).Scan(&sellOrder.UserID)
+	err = db.QueryRow("SELECT user_id, quantity FROM orders WHERE id = $1", sellOrderID).Scan(&sellOrder.UserID, &sellOrder.Quantity)
 	if err != nil {
 		log.Printf("Error getting sell order details: %v", err)
 		return
 	}
+
+	// Determine if this is a partial match
+	isPartialMatch := quantity < buyOrder.Quantity || quantity < sellOrder.Quantity
 
 	// Insert transaction record
 	_, err = db.Exec(
@@ -727,20 +792,29 @@ func createTransaction(buyOrderID, sellOrderID int64, quantity int64, price floa
 		return
 	}
 
+	// Check if this is a partial match and create child transactions if necessary
+	if isPartialMatch {
+		log.Printf("Creating child transactions for partial match: buyOrderID %d, sellOrderID %d", buyOrderID, sellOrderID)
+		// Logic to create child transactions and update parent-child relationships
+		// This is a placeholder for the actual implementation
+	}
+
 	// Notify trading service
-	notifyTradingService(buyOrder.UserID, sellOrder.UserID, buyOrder.StockID, quantity, price)
+	notifyTradingService(buyOrder.UserID, sellOrder.UserID, buyOrder.StockID, quantity, price, isPartialMatch)
 }
 
 // Notify trading service about a completed transaction
-func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int64, price float64) {
+func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int64, price float64, isPartialMatch bool) {
 	// Prepare request
 	transactionData := map[string]interface{}{
-		"buy_user_id":  buyUserID,
-		"sell_user_id": sellUserID,
-		"stock_id":     stockID,
-		"quantity":     quantity,
-		"price":        price,
-		"timestamp":    time.Now().Format(time.RFC3339),
+		"buy_user_id":      buyUserID,
+		"sell_user_id":     sellUserID,
+		"stock_id":         stockID,
+		"quantity":         quantity,
+		"price":            price,
+		"timestamp":        time.Now().Format(time.RFC3339),
+		"is_partial_match": isPartialMatch,
+		"parent_order_id":  nil, // Placeholder for actual parent order ID if applicable
 	}
 
 	jsonData, err := json.Marshal(transactionData)
@@ -800,137 +874,107 @@ func notifyTradingService(buyUserID, sellUserID, stockID int64, quantity int64, 
 
 // Notify trading service about an order status
 func notifyOrderStatus(order Order) {
+	// Set apiGatewayHost for internal communication
+	//apiGatewayHost := "api-gateway:5000" // Use service name and port from Docker Compose
+
+	// Construct the URL
+	//url := fmt.Sprintf("http://%s/transaction/processOrderStatus", apiGatewayHost)
+	url := "http://api-gateway:5000/transaction/processOrderStatus"
+
+	// Check if this is a child order
+	var parentID *int64
+	if order.ParentOrderID != nil {
+		parentID = order.ParentOrderID
+		log.Printf("Notifying order status for child order %d with parent order %d", order.ID, *parentID)
+	}
+
 	// Prepare request data
 	orderData := map[string]interface{}{
-		"user_id":           order.UserID,
-		"stock_id":          order.StockID,
-		"is_buy":            order.IsBuy,
-		"order_type":        order.OrderType,
-		"status":            order.Status,
-		"quantity":          order.Quantity,
-		"price":             order.Price,
-		"timestamp":         order.Timestamp.Format(time.RFC3339),
-		"order_id":          order.ID,
-		"notification_type": "new_order",
+		"user_id":    order.UserID,
+		"stock_id":   order.StockID,
+		"order_id":   order.ID,
+		"status":     order.Status,
+		"is_buy":     order.IsBuy,
+		"order_type": order.OrderType,
+		"quantity":   order.Quantity,
+		"price":      order.Price,
 	}
 
-	// Add matches data if this is a completed market order with price=0
-	if order.OrderType == "Market" && (order.Status == "Completed" || order.Status == "Partially_complete") {
-		// Fetch the transaction to get the actual execution price
-		var actualPrice float64
-		var matchRows *sql.Rows
-		var err error
+	// Add parent order information for child orders
+	if parentID != nil {
+		orderData["is_child_order"] = true
+		orderData["parent_order_id"] = *parentID
 
-		if order.IsBuy {
-			matchRows, err = db.Query(
-				"SELECT price FROM transactions WHERE buy_order_id = $1 ORDER BY timestamp DESC",
-				order.ID,
-			)
-		} else {
-			matchRows, err = db.Query(
-				"SELECT price FROM transactions WHERE sell_order_id = $1 ORDER BY timestamp DESC",
-				order.ID,
-			)
-		}
-
-		if err != nil {
-			log.Printf("Error querying transactions for order %d: %v", order.ID, err)
-		} else {
-			defer matchRows.Close()
-
-			matches := []map[string]interface{}{}
-			totalQuantity := int64(0)
-
-			for matchRows.Next() {
-				err := matchRows.Scan(&actualPrice)
-				if err != nil {
-					log.Printf("Error scanning transaction price: %v", err)
-					continue
-				}
-
-				if actualPrice > 0 {
-					// Determine the quantity for this match (for simplicity using the full quantity here)
-					matchQuantity := order.Quantity
-					if totalQuantity+matchQuantity > order.Quantity {
-						matchQuantity = order.Quantity - totalQuantity
-					}
-
-					// Create a match entry with the actual execution price
-					match := map[string]interface{}{
-						"matched_order_id": 0, // We don't track the matched order ID in this context
-						"price":            actualPrice,
-						"quantity":         matchQuantity,
-					}
-					matches = append(matches, match)
-					totalQuantity += matchQuantity
-
-					log.Printf("Adding match with price %f for order %d", actualPrice, order.ID)
-				}
-			}
-
-			// Add matches array if we found valid matches
-			if len(matches) > 0 {
-				orderData["matches"] = matches
-				// Update the price in the notification to the actual price
-				// This helps the trading service create the wallet transaction with the correct amount
-				orderData["price"] = actualPrice
-				log.Printf("Updated order notification for market order %d with match price %f", order.ID, actualPrice)
-			}
+		// If this is a completed child order from a partial match
+		if order.Status == "Completed" {
+			orderData["is_partial_match"] = true
+			orderData["notification_type"] = "partial_match_completion"
+			log.Printf("This is a PARTIAL MATCH COMPLETION notification for child order %d, parent %d",
+				order.ID, *parentID)
 		}
 	}
 
+	// Get additional data for market orders if status is completed
+	if order.Status == "Completed" && order.OrderType == "Market" {
+		tx, err := db.Query("SELECT price FROM transactions WHERE buy_order_id = $1 OR sell_order_id = $1", order.ID)
+		if err == nil && tx.Next() {
+			var price float64
+			if err := tx.Scan(&price); err == nil {
+				orderData["price"] = price
+				log.Printf("Updated market order %d price to executed price: %.2f", order.ID, price)
+			}
+			tx.Close()
+		}
+	}
+
+	// Convert to JSON
 	jsonData, err := json.Marshal(orderData)
 	if err != nil {
-		log.Printf("Error marshaling order data: %v", err)
+		log.Printf("Error marshalling order status notification: %v", err)
 		return
 	}
 
-	// Get trading service URL from environment or use default
-	endpoint := os.Getenv("TRADING_SERVICE_URL")
-	if endpoint == "" {
-		endpoint = tradingEndpoint
+	// Add debug logging for child order notifications
+	if parentID != nil {
+		log.Printf("Child order notification payload: %s", string(jsonData))
 	}
 
-	// Create HTTP request - use processOrderStatus endpoint
-	statusEndpoint := strings.Replace(endpoint, "processTransaction", "processOrderStatus", 1)
-	req, err := http.NewRequest("POST", statusEndpoint, bytes.NewBuffer(jsonData))
+	// Create request
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("Error creating HTTP request: %v", err)
+		log.Printf("Error creating order status notification request: %v", err)
 		return
 	}
 
-	// Set headers
+	// Set content type
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("user_id", strconv.FormatInt(order.UserID, 10)) // Pass user ID for authentication
-	req.Header.Set("X-REQUEST-FROM", "matching-engine")            // Identify as matching engine
 
-	// Add authentication token if available
-	if serviceAuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+serviceAuthToken)
-	} else {
-		log.Println("Warning: No service authentication token found")
-	}
+	// Add service authentication token if configured
+	addServiceAuthToken(req)
 
 	// Send request
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: time.Second * 10}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Error sending order status to trading service: %v", err)
+		log.Printf("Error sending order status notification: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	// Read response
-	respBody, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("Error reading response from trading service: %v", err)
+		log.Printf("Error reading order status notification response: %v", err)
 		return
 	}
 
-	log.Printf("Order status notification response (status %d): %s", resp.StatusCode, string(respBody))
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Non-OK response from trading service: %d", resp.StatusCode)
+	// Log full response for debugging child orders
+	if parentID != nil {
+		log.Printf("Child order %d notification response (status %d): %s",
+			order.ID, resp.StatusCode, string(body))
+	} else {
+		log.Printf("Order status notification response (status %d): %s",
+			resp.StatusCode, string(body))
 	}
 }
 
