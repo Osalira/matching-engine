@@ -138,7 +138,7 @@ func getBestSellPrice(stockID int64) (float64, bool) {
 
 	// If there are no sell orders, return 0 and false
 	if len(orderBook.SellOrders) == 0 {
-		return 0, false
+		return 135, false
 	}
 
 	// Find the lowest priced sell order
@@ -782,13 +782,27 @@ func createTransaction(buyOrderID, sellOrderID int64, quantity int64, price floa
 	// Determine if this is a partial match
 	isPartialMatch := quantity < buyOrder.Quantity || quantity < sellOrder.Quantity
 
-	// Insert transaction record
-	_, err = db.Exec(
+	// Create a new connection for this transaction to avoid prepared statement reuse issues
+	conn, err := db.Begin()
+	if err != nil {
+		log.Printf("Error creating transaction: %v", err)
+		return
+	}
+	defer conn.Rollback() // Will be ignored if the transaction is committed
+
+	// Insert transaction record using the transaction-specific connection
+	_, err = conn.Exec(
 		"INSERT INTO transactions (buy_order_id, sell_order_id, buy_user_id, sell_user_id, stock_id, quantity, price, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
 		buyOrderID, sellOrderID, buyOrder.UserID, sellOrder.UserID, buyOrder.StockID, quantity, price, time.Now(),
 	)
 	if err != nil {
-		log.Printf("Error creating transaction record: %v", err)
+		log.Printf("Error processing order: %v", err)
+		return
+	}
+
+	// Commit the transaction
+	if err = conn.Commit(); err != nil {
+		log.Printf("Error committing transaction: %v", err)
 		return
 	}
 

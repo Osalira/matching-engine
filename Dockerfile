@@ -48,9 +48,12 @@ EXPOSE 8080
 
 # Command to run the application with integrated wait-for-db logic
 CMD bash -c '\
-    echo "Waiting for PostgreSQL at ${DB_HOST}:${DB_PORT}..." && \
+    # For initialization, use direct DB connection if provided
+    INIT_DB_HOST=${DB_INIT_HOST:-$DB_HOST} && \
+    INIT_DB_PORT=${DB_INIT_PORT:-$DB_PORT} && \
+    echo "Waiting for PostgreSQL at ${INIT_DB_HOST}:${INIT_DB_PORT}..." && \
     ATTEMPT=0 && MAX_ATTEMPTS=30 && \
-    until PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -c "\q" > /dev/null 2>&1; do \
+    until PGPASSWORD=$DB_PASSWORD psql -h $INIT_DB_HOST -p $INIT_DB_PORT -U $DB_USER -c "\q" > /dev/null 2>&1; do \
       ATTEMPT=$((ATTEMPT+1)) && \
       if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then \
         echo "PostgreSQL is not available after $MAX_ATTEMPTS attempts. Exiting." && \
@@ -62,12 +65,12 @@ CMD bash -c '\
     echo "PostgreSQL is up and running!" && \
     echo "Checking if database $DB_NAME exists..." && \
     ATTEMPT=0 && \
-    until PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -lqt | cut -d \| -f 1 | grep -qw $DB_NAME; do \
+    until PGPASSWORD=$DB_PASSWORD psql -h $INIT_DB_HOST -p $INIT_DB_PORT -U $DB_USER -lqt | cut -d \| -f 1 | grep -qw $DB_NAME; do \
       ATTEMPT=$((ATTEMPT+1)) && \
       if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then \
         echo "Database $DB_NAME does not exist after $MAX_ATTEMPTS attempts. Attempting to create it..." && \
-        PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -c "CREATE DATABASE $DB_NAME;" > /dev/null 2>&1 && \
-        if PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -lqt | cut -d \| -f 1 | grep -qw $DB_NAME; then \
+        PGPASSWORD=$DB_PASSWORD psql -h $INIT_DB_HOST -p $INIT_DB_PORT -U $DB_USER -c "CREATE DATABASE $DB_NAME;" > /dev/null 2>&1 && \
+        if PGPASSWORD=$DB_PASSWORD psql -h $INIT_DB_HOST -p $INIT_DB_PORT -U $DB_USER -lqt | cut -d \| -f 1 | grep -qw $DB_NAME; then \
           echo "Successfully created database $DB_NAME."; \
         else \
           echo "Failed to create database $DB_NAME. Exiting." && \
@@ -80,10 +83,10 @@ CMD bash -c '\
     done && \
     echo "Database $DB_NAME is ready!" && \
     echo "Checking if tables exist in database..." && \
-    TABLE_COUNT=$(PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '\''public'\'';" | xargs) && \
+    TABLE_COUNT=$(PGPASSWORD=$DB_PASSWORD psql -h $INIT_DB_HOST -p $INIT_DB_PORT -U $DB_USER -d $DB_NAME -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '\''public'\'';" | xargs) && \
     if [ "$TABLE_COUNT" -eq "0" ]; then \
       echo "No tables found, initializing database schema..." && \
-      PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -f schema.sql && \
+      PGPASSWORD=$DB_PASSWORD psql -h $INIT_DB_HOST -p $INIT_DB_PORT -U $DB_USER -d $DB_NAME -f schema.sql && \
       echo "Schema initialized successfully!"; \
     else \
       echo "Tables already exist, skipping schema initialization."; \
